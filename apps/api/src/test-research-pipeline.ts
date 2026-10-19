@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 // Research pipeline test with deterministic fake search/fetch/embed/llm. No network, no model.
 // Runs ONLY against a copy of the database given by BRAIN_DB.
 // Usage: BRAIN_DB=/tmp/brain-test.sqlite npx tsx apps/api/src/test-research-pipeline.ts
@@ -35,7 +36,7 @@ const PAGES: Record<string, string> = {
 let llmMode: "good" | "garbage" | "badQueries" = "good";
 let supportMode: "yes" | "partial" | "no" | "bad" | "bad-once" = "yes";
 let supportCalls = 0;
-let synthMode: "default" | "multi" | "claimVariant" | "judgeCases" = "default";
+let synthMode: "default" | "multi" | "claimVariant" | "assign" = "default";
 let lastSynthSystem = "";
 const fetchCalls: string[] = [];
 
@@ -57,13 +58,17 @@ const fakeSearch = (q: string) => Promise.resolve([
 ]);
 
 const KEYS = ["lora", "battery", "sensor", "sleep", "tomato"];
-const fakeEmbed = (texts: string[]) => Promise.resolve(texts.map(t => KEYS.map(k => (t.toLowerCase().split(k).length - 1) + 0.01)));
+// "[offtopic]" texts point away from every question (negative cosine) -> below any threshold.
+const fakeEmbed = (texts: string[]) => Promise.resolve(texts.map(t => t.includes("[offtopic]") ? KEYS.map(() => -1)
+  : KEYS.map(k => (t.toLowerCase().split(k).length - 1) + 0.01)));
+const systemPrompts: string[] = [];
 
 const modelCalls: Array<{ kind: string; model: string | undefined }> = [];
 function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promise<string> {
   const sys = messages[0]!.content;
+  systemPrompts.push(sys);
   modelCalls.push({ kind: sys.includes("open questions") ? "questions" : sys.includes("write web search queries") ? "queries"
-    : sys.includes("INDEPENDENT judgments") ? "judge" : "synthesis", model: opts.model });
+    : sys.includes("judge only whether the QUOTE supports") ? "judge" : "synthesis", model: opts.model });
   if (sys.includes("open questions")) {
     return Promise.resolve(llmMode === "garbage" ? "I cannot help with that."
       : JSON.stringify({ questions: ["How long can a LoRa sensor run on battery?", "What deep sleep current does the ESP32-S3 draw?", "What range does LoRa reach?"] }));
@@ -72,15 +77,14 @@ function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promis
     return Promise.resolve(llmMode === "badQueries" ? "not json"
       : JSON.stringify({ queries: ["LoRa sensor battery life", "ESP32-S3 deep sleep current", "LoRa range"] }));
   }
-  if (sys.includes("INDEPENDENT judgments")) {
+  if (sys.includes("judge only whether the QUOTE supports")) {
     supportCalls++;
     const claimsIn = [...messages[1]!.content.matchAll(/^CLAIM: (.*)$/gm)].map(m => m[1]!);
     const n = claimsIn.length;
-    const jq = (c: string) => c.includes("[low]") || c.includes("[q0]") ? 0 : c.includes("[q9]") ? 9 : c === "Supported claim" ? 2 : 1;
-    const hw = (c: string) => c.includes("[diff]") ? "different" : c.includes("[rel]") ? "related" : "same";
     if (supportMode === "bad" || (supportMode === "bad-once" && supportCalls === 1)) return Promise.resolve("I think they are fine");
     const level = supportMode === "bad-once" ? "yes" : supportMode;
-    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level, question: jq(claimsIn[i]!), hardware: hw(claimsIn[i]!) })) }));
+    const sup = (c: string) => c.includes("[nosupport]") ? "no" : level;
+    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: sup(claimsIn[i]!), subject: `subject of ${i + 1}` })) }));
   }
   lastSynthSystem = sys;
   // Synthesis: quote the first sentence of excerpt 1 verbatim, plus a fabricated quote and a bad chunk number.
@@ -93,13 +97,12 @@ function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promis
       { claim: "  SUPPORTED   claim!! ", quote: excerpts[0]!.sentences[1]!, chunk: 1 }
     ] }));
   }
-  if (synthMode === "judgeCases") {
+  if (synthMode === "assign") {
     const [e1, e2, e3] = excerpts;
     return Promise.resolve(JSON.stringify({ findings: [
-      { claim: "jc none [q0]", quote: e1!.sentences[0], chunk: e1!.n },
-      { claim: "jc out of range [q9]", quote: e2!.sentences[0], chunk: e2!.n },
-      { claim: "jc different board [diff]", quote: e3!.sentences[0], chunk: e3!.n },
-      { claim: "jc related board [rel]", quote: e1!.sentences[1], chunk: e1!.n }
+      { claim: "assign deep sleep", quote: e1!.sentences[0], chunk: e1!.n },
+      { claim: "assign [offtopic]", quote: e2!.sentences[0], chunk: e2!.n },
+      { claim: "assign battery sleep [nosupport]", quote: e3!.sentences[0], chunk: e3!.n }
     ] }));
   }
   if (synthMode === "multi") {
@@ -109,7 +112,7 @@ function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promis
       { claim: "multi A2", quote: e1!.sentences[1], chunk: e1!.n, question: 1 },
       { claim: "multi A3", quote: e1!.sentences[2], chunk: e1!.n, question: 1 },
       { claim: "multi reused", quote: e1!.sentences[0], chunk: e1!.n, question: 1 },
-      { claim: "multi B [low]", quote: e2!.sentences[0], chunk: e2!.n, question: 2 },
+      { claim: "multi B [offtopic]", quote: e2!.sentences[0], chunk: e2!.n, question: 2 },
       { claim: "multi C [medium]", quote: e3!.sentences[0], chunk: e3!.n, question: "Q3" }
     ] }));
   }
@@ -221,8 +224,10 @@ try {
   const r1 = await runResearch(db, idea, deps({ stillOwned: () => store.owns(j1) }));
   check("questions generated then one query per question", r1.result.questions.length === 3 && r1.result.queries.length === 3 && !r1.result.queryFallback && r1.result.queryFallbackKind === "none", r1.result.questions);
   const fd0 = r1.result.findingsDetail[0];
-  check("judge-chosen question overrides excerpt question (excerpt kept, labeled)", fd0?.excerptQuestion === 1 && fd0?.judgeQuestion === 2 && fd0?.judgeQuestionText === r1.result.questions[1] && fd0?.outcome === "kept", fd0);
-  check("synthesis prompt requires claims to name the board", lastSynthSystem.includes("must name that exact board"));
+  check("finding has similarity, question text, subject, excerpt question", fd0?.outcome === "kept" && typeof fd0?.similarity === "number" &&
+    fd0!.similarity! >= r1.result.minQuestionSim && fd0?.questionText === r1.result.questions[fd0!.question! - 1] && fd0?.subject === "subject of 1" && "excerptQuestion" in fd0!, fd0);
+  check("synthesis prompt asks claims to name the specific subject", lastSynthSystem.includes("must name the specific subject"));
+  check("no hardware fields remain in result/findingsDetail", !JSON.stringify(r1.result).includes("hardware") && !("hardware" in fd0!));
   check("per-question ranking used; excerpts labeled by question", r1.result.rankingMode === "per_question" && r1.result.excerpts.every(e => e.question !== null), r1.result.excerpts.map(e => e.question));
   const kinds = (k: string) => modelCalls.filter(c => c.kind === k).map(c => c.model);
   check("synth + judge use SYNTH_MODEL; questions + queries use default", kinds("synthesis").length > 0 && kinds("synthesis").every(m => m === SYNTH_MODEL) &&
@@ -281,20 +286,22 @@ try {
   const outcome = (c: string) => rm.checked.find(f => f.claim === c)?.outcome;
   check("reused quote dropped (first use kept)", rm.result.droppedReusedQuote === 1 && outcome("multi A1") === "kept" && !rm.checked.some(f => f.claim === "multi reused"), rm.result.droppedReusedQuote);
   check("per-source kept cap (max 2 per source)", rm.result.droppedSourceCap === 1 && outcome("multi A3") === "source_cap" && outcome("multi A2") === "kept");
-  check("claim not answering its question dropped", rm.result.droppedLowRelevance === 1 && outcome("multi B [low]") === "low_relevance");
+  check("off-topic claim (below similarity threshold) dropped", rm.result.droppedNoQuestion === 1 && outcome("multi B [offtopic]") === "no_question");
   check("claim answering its question kept", outcome("multi C [medium]") === "kept");
   check("multi run keeps exactly A1, A2, C", JSON.stringify(rm.findings.map(f => f.claim)) === JSON.stringify(["multi A1", "multi A2", "multi C [medium]"]), rm.findings.map(f => f.claim));
 
-  // Judge cases: question 0, out-of-range, hardware different/related
-  synthMode = "judgeCases";
-  const rj = await runResearch(db, idea, deps());
+  // Question assignment by embedding similarity; judge filters only on support
+  synthMode = "assign";
+  const ra = await runResearch(db, idea, deps());
   synthMode = "default";
-  const jo = (c: string) => rj.checked.find(f => f.claim === c)?.outcome;
-  check("judge question 0 dropped", jo("jc none [q0]") === "low_relevance");
-  check("judge question out of range -> unchecked", jo("jc out of range [q9]") === "unchecked" && rj.result.droppedUnchecked === 1);
-  check("hardware 'different' dropped", jo("jc different board [diff]") === "hardware_different" && rj.result.droppedHardwareDifferent === 1);
-  check("hardware 'related' kept and recorded", jo("jc related board [rel]") === "kept" && rj.result.keptHardwareRelated === 1 &&
-    rj.result.findingsDetail.find(f => f.claim === "jc related board [rel]")?.hardware === "related", rj.result.findingsDetail.map(f => f.outcome));
+  const ad = (c: string) => ra.result.findingsDetail.find(f => f.claim === c);
+  check("claim assigned to most similar question (deep sleep -> Q2)", ad("assign deep sleep")?.question === 2 && ad("assign deep sleep")?.outcome === "kept" && (ad("assign deep sleep")?.similarity ?? 0) > 0.9, ad("assign deep sleep"));
+  check("below-threshold claim dropped as no_question, similarity recorded", ad("assign [offtopic]")?.outcome === "no_question" && ad("assign [offtopic]")?.question === null && (ad("assign [offtopic]")?.similarity ?? 1) < ra.result.minQuestionSim && ra.result.droppedNoQuestion === 1);
+  check("judge filters only on support (on-topic but unsupported dropped)", ad("assign battery sleep [nosupport]")?.outcome === "unsupported" && ra.result.similarityDistribution.length === 3);
+  const banned = /lora|heltec|\bboard\b|hardware|esp32|sx126/i;
+  check("no domain words in any system prompt sent", systemPrompts.length > 0 && systemPrompts.every(p => !banned.test(p)), systemPrompts.find(p => banned.test(p))?.slice(0, 200));
+  const src = readFileSync(new URL("./research.ts", import.meta.url), "utf8");
+  check("research.ts source has no LoRa/Heltec/board/hardware strings", !banned.test(src), src.match(banned)?.[0]);
 
   // Claim dedupe across runs: different quote, same normalized claim
   synthMode = "claimVariant";

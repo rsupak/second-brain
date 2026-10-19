@@ -23,7 +23,7 @@ async function processJob(job: ResearchJob) {
       search, fetch: liveFetch, embed: texts => embedTexts(texts), llm: generateResponse,
       log: m => console.log(`  ${m}`), stillOwned: () => store.owns(job)
     });
-    for (const c of checked) console.log(`  ${c.outcome} (${c.rating === "unchecked" ? "unchecked" : `support=${c.rating.supported}, question=${c.rating.question}, hardware=${c.rating.hardware}, excerptQ=${c.question}`}): ${JSON.stringify(c.claim).slice(0, 160)}`);
+    for (const c of checked) console.log(`  ${c.outcome} (${c.rating === "unchecked" ? "unchecked" : `support=${c.rating.supported}, subject=${c.rating.subject}, question=${c.question}, sim=${c.similarity?.toFixed(3)}`}): ${JSON.stringify(c.claim).slice(0, 160)}`);
     for (const d of dropped) console.log(`  dropped (${d.reason}): ${JSON.stringify(d.quote).slice(0, 160)}`);
 
     const full = store.complete(job, ideaId, findings, result);
