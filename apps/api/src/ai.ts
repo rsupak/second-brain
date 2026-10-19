@@ -1,3 +1,42 @@
+import Database from "better-sqlite3";
+import { createInferenceLock, LOCK_NAME, type LockCallOptions } from "./inference-lock.js";
+
+export class InferenceLockMissingError extends Error {
+  constructor(dbPath: string) {
+    super(
+      `inference_lock table or '${LOCK_NAME}' row is missing in ${dbPath}. ` +
+      `Run: BRAIN_DB=${dbPath} ./node_modules/.bin/tsx apps/api/src/migrate-inference-lock.ts`
+    );
+    this.name = "InferenceLockMissingError";
+  }
+}
+
+let inferenceLock: ReturnType<typeof createInferenceLock> | undefined;
+let lockHooks: Pick<LockCallOptions, "onAcquire" | "onRelease"> = {};
+
+/** Optional instrumentation for tests. Does not change locking behavior. */
+export function setInferenceLockHooks(hooks: Pick<LockCallOptions, "onAcquire" | "onRelease">) {
+  lockHooks = hooks;
+}
+
+function getInferenceLock() {
+  if (inferenceLock) return inferenceLock;
+  const dbPath = process.env.BRAIN_DB ?? "./data/brain.sqlite";
+  const db = new Database(dbPath);
+  db.pragma("busy_timeout = 5000");
+  const hasTable = db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'inference_lock'`
+  ).get();
+  const hasRow = hasTable &&
+    db.prepare(`SELECT 1 FROM inference_lock WHERE name = ?`).get(LOCK_NAME);
+  if (!hasRow) {
+    db.close();
+    throw new InferenceLockMissingError(dbPath);
+  }
+  inferenceLock = createInferenceLock(db);
+  return inferenceLock;
+}
+
 interface OllamaMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -13,6 +52,17 @@ interface GenerateOptions {
 export async function generateResponse(
   messages: OllamaMessage[],
   options: GenerateOptions = {}
+): Promise<string> {
+  return getInferenceLock().withInferenceLock(
+    lockSignal => callOllama(messages, options, lockSignal),
+    lockHooks
+  );
+}
+
+async function callOllama(
+  messages: OllamaMessage[],
+  options: GenerateOptions,
+  lockSignal: AbortSignal
 ): Promise<string> {
   const response = await fetch(
     "http://127.0.0.1:11434/api/chat",
@@ -35,9 +85,10 @@ export async function generateResponse(
           num_predict: options.numPredict ?? 700
         }
       }),
-      signal: AbortSignal.timeout(
-        options.timeoutMs ?? 300000
-      )
+      signal: AbortSignal.any([
+        lockSignal,
+        AbortSignal.timeout(options.timeoutMs ?? 300000)
+      ])
     }
   );
 
