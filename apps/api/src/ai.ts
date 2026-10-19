@@ -47,6 +47,8 @@ interface GenerateOptions {
   temperature?: number;
   numPredict?: number;
   timeoutMs?: number;
+  /** Optional context window; defaults to 2048 (unchanged behavior). */
+  numCtx?: number;
 }
 
 export async function generateResponse(
@@ -81,7 +83,7 @@ async function callOllama(
           : {}),
         options: {
           temperature: options.temperature ?? 0.2,
-          num_ctx: 2048,
+          num_ctx: options.numCtx ?? 2048,
           num_predict: options.numPredict ?? 700
         }
       }),
@@ -132,4 +134,33 @@ async function callOllama(
   }
 
   return content;
+}
+
+/**
+ * Embeddings through the same cross-process inference lock as generateResponse().
+ * Returns one vector per input, in order.
+ */
+export async function embedTexts(
+  inputs: string[],
+  options: { model?: string; timeoutMs?: number } = {}
+): Promise<number[][]> {
+  if (inputs.length === 0) return [];
+  return getInferenceLock().withInferenceLock(async lockSignal => {
+    const response = await fetch("http://127.0.0.1:11434/api/embed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: options.model ?? "qwen3-embedding:0.6b", input: inputs }),
+      signal: AbortSignal.any([lockSignal, AbortSignal.timeout(options.timeoutMs ?? 120000)])
+    });
+    if (!response.ok) {
+      throw new Error(`Embedding failed (${response.status}): ${await response.text()}`);
+    }
+    const data = await response.json() as { embeddings?: number[][] };
+    const vectors = data.embeddings ?? [];
+    if (vectors.length !== inputs.length ||
+        !vectors.every(v => v.length > 0 && v.every(Number.isFinite))) {
+      throw new Error("Invalid embeddings returned by Ollama");
+    }
+    return vectors;
+  }, lockHooks);
 }
