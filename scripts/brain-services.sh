@@ -1,6 +1,6 @@
 #!/bin/bash
 # Manage Second Brain background workers as launchd user agents (the API dev server is NOT managed here).
-# Usage: scripts/brain-services.sh install|start|stop|restart|status|uninstall
+# Usage: scripts/brain-services.sh install|start|stop|restart|status|uninstall [worker|evaluate|research]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTS="$HOME/Library/LaunchAgents"
@@ -59,6 +59,12 @@ status() {
     else echo "$l: not loaded"; fi
   done
 }
+# Optional 2nd arg limits the command to one service: worker | evaluate | research
+if [ -n "${2:-}" ]; then
+  match=(); for s in "${SERVICES[@]}"; do [ "${s%%:*}" = "org.secondbrain.$2" ] && match+=("$s"); done
+  [ ${#match[@]} -eq 1 ] || { echo "Unknown service: $2 (worker|evaluate|research)"; exit 2; }
+  SERVICES=("${match[@]}")
+fi
 case "${1:-status}" in
   install) install ;; start) start ;; stop) stop ;; restart) stop; sleep 2; start ;; status) status ;;
   uninstall) stop; for s in "${SERVICES[@]}"; do rm -f "$AGENTS/${s%%:*}.plist"; done; echo "plists removed" ;;

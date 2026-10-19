@@ -77,12 +77,13 @@ async function evaluate(job: EvaluationJob) {
 
 Return ONLY one valid JSON object with these fields, in this order:
 
-- "reasoning": object with one short sentence per dimension, written BEFORE choosing scores:
-    {"feasibility": "...", "cost": "...", "relevance": "...", "novelty": "..."}
-  Each sentence names the main reason and the biggest risk for that dimension.
+- "feasibility_reason": one sentence: main reason and biggest risk for feasibility
 - "feasibility": integer 1-5
+- "cost_reason": one sentence: main reason and biggest risk for cost
 - "cost": integer 1-5
+- "relevance_reason": one sentence for relevance
 - "relevance": integer 1-5
+- "novelty_reason": one sentence for novelty
 - "novelty": integer 1-5
 - "summary": non-empty string explaining the evaluation
 - "requirements": array of strings describing implementation requirements
@@ -137,7 +138,7 @@ RULES:
     },
     {
       role: "user",
-      content: `Evaluate this idea and return the evaluation JSON object (reasoning, feasibility, cost, relevance, novelty, summary, requirements, limitations, claims). Do not repeat the input.
+      content: `Evaluate this idea and return the evaluation JSON object (feasibility_reason, feasibility, cost_reason, cost, relevance_reason, relevance, novelty_reason, novelty, summary, requirements, limitations, claims). Do not repeat the input.
 
 Idea: ${JSON.stringify({
         title: idea.title,
