@@ -68,6 +68,7 @@ async function evaluate(job: EvaluationJob) {
   if (!idea) throw new Error("Idea not found");
 
   const flaggedClaims = detectClaims(idea.content);
+  const startedAt = Date.now();
 
   const raw = await generateResponse([
     {
@@ -149,6 +150,8 @@ Idea: ${JSON.stringify({
     format: "json",
     temperature: 0,
     numPredict: 1600,
+    // EVAL_MODEL overrides the scorer; unset keeps generateResponse's default model.
+    ...(process.env.EVAL_MODEL ? { model: process.env.EVAL_MODEL } : {}),
     // Prompt with anchors + examples exceeds the 2048 default context.
     numCtx: 4096
   });
@@ -181,7 +184,7 @@ Idea: ${JSON.stringify({
   // only if this worker still owns an unexpired lease.
   store.saveResult(job, evaluation);
 
-  console.log(`Evaluated: ${idea.title}`);
+  console.log(`Evaluated: ${idea.title} (${process.env.EVAL_MODEL ?? "default model"}, ${Date.now() - startedAt} ms)`);
 }
 
 async function processJob(job: EvaluationJob) {
