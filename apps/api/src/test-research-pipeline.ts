@@ -295,6 +295,7 @@ try {
   const ra = await runResearch(db, idea, deps());
   synthMode = "default";
   const ad = (c: string) => ra.result.findingsDetail.find(f => f.claim === c);
+  check("minQuestionSim default is 0.6 (unless env override)", process.env.RESEARCH_MIN_QUESTION_SIM !== undefined || ra.result.minQuestionSim === 0.6, ra.result.minQuestionSim);
   check("claim assigned to most similar question (deep sleep -> Q2)", ad("assign deep sleep")?.question === 2 && ad("assign deep sleep")?.outcome === "kept" && (ad("assign deep sleep")?.similarity ?? 0) > 0.9, ad("assign deep sleep"));
   check("below-threshold claim dropped as no_question, similarity recorded", ad("assign [offtopic]")?.outcome === "no_question" && ad("assign [offtopic]")?.question === null && (ad("assign [offtopic]")?.similarity ?? 1) < ra.result.minQuestionSim && ra.result.droppedNoQuestion === 1);
   check("judge filters only on support (on-topic but unsupported dropped)", ad("assign battery sleep [nosupport]")?.outcome === "unsupported" && ra.result.similarityDistribution.length === 3);

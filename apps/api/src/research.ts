@@ -29,7 +29,7 @@ export const LIMITS = {
   topChunks: 6, maxChunksPerSite: 2, maxFindingsPerSite: 2, embedBatch: 16,
   chunksPerQuestion: 2, maxExcerpts: 8, maxExcerptChars: 1200, maxExcerptTotalChars: 16000,
   /** Min cosine(claim, question) to assign a claim to a question; below it the claim is off-topic. */
-  minQuestionSim: Number(process.env.RESEARCH_MIN_QUESTION_SIM ?? 0.5)
+  minQuestionSim: Number(process.env.RESEARCH_MIN_QUESTION_SIM ?? 0.6)
 };
 
 /** Model for synthesis and the support judge. Questions/queries stay on the generateResponse default. */
