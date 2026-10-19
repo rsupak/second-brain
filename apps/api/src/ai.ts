@@ -49,6 +49,8 @@ interface GenerateOptions {
   timeoutMs?: number;
   /** Optional context window; defaults to 2048 (unchanged behavior). */
   numCtx?: number;
+  /** Optional model override; defaults to qwen3:4b (unchanged behavior). */
+  model?: string;
 }
 
 export async function generateResponse(
@@ -74,7 +76,7 @@ async function callOllama(
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "qwen3:4b",
+        model: options.model ?? "qwen3:4b",
         messages,
         stream: false,
         think: false,

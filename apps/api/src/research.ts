@@ -18,7 +18,7 @@ export type ResearchDeps = {
   search: (query: string) => Promise<SearchHit[]>;
   fetch: (url: string) => Promise<FetchResult>;
   embed: (texts: string[]) => Promise<number[][]>;
-  llm: (messages: ChatMessage[], opts: { format?: "json"; temperature: number; numPredict: number; numCtx?: number }) => Promise<string>;
+  llm: (messages: ChatMessage[], opts: { format?: "json"; temperature: number; numPredict: number; numCtx?: number; model?: string }) => Promise<string>;
   log?: (msg: string) => void;
   /** Return false to abort early (lease lost). */
   stillOwned?: () => boolean;
@@ -26,8 +26,16 @@ export type ResearchDeps = {
 
 export const LIMITS = {
   maxQueries: 5, maxSources: 5, maxCandidates: 15, maxCandidatesPerSite: 2,
-  topChunks: 6, maxChunksPerSite: 2, maxFindingsPerSite: 2, embedBatch: 16
+  topChunks: 6, maxChunksPerSite: 2, maxFindingsPerSite: 2, embedBatch: 16,
+  chunksPerQuestion: 2, maxExcerpts: 8, maxExcerptChars: 1200, maxExcerptTotalChars: 16000
 };
+
+/** Model for synthesis and the support/answers judge. Questions/queries stay on the generateResponse default. */
+export const SYNTH_MODEL = process.env.RESEARCH_SYNTH_MODEL ?? "gemma4:e4b-it-qat";
+
+/** Sites that usually block or need JavaScript: deprioritized as candidates and given no type boost. */
+export const BLOCKED_SITES = new Set((process.env.RESEARCH_BLOCKED_SITES ?? "researchgate,acm,sciencedirect,mdpi")
+  .split(",").map(x => x.trim()).filter(Boolean));
 
 // ---------- source grouping and typing ----------
 
@@ -134,7 +142,8 @@ export function pickCandidates(lists: SearchHit[][], max: number, perSite = LIMI
       pool.push({ url, title: hit.title, site: siteKey(url), type: sourceType(url), query: q, pos: pos++ });
     });
   }
-  const rank = (c: { type: SourceType; pos: number }) => TYPE_ORDER.indexOf(c.type) * 1e6 + c.pos;
+  const rank = (c: { type: SourceType; site: string; pos: number }) =>
+    (BLOCKED_SITES.has(c.site) ? TYPE_ORDER.length : TYPE_ORDER.indexOf(c.type)) * 1e6 + c.pos;
   const out: Array<Candidate & { pos: number }> = [];
   const perSiteCount = new Map<string, number>();
   const take = (c: Candidate & { pos: number }) => {
@@ -175,6 +184,7 @@ export async function generateQueries(idea: Idea, deps: ResearchDeps): Promise<{
       { role: "system", content: `You help evaluate an engineering idea. List the 3 to 5 most important open questions the idea depends on
 (for example: achievable range, power budget and battery life, gateway or integration options, real-world deployments, hardware limits).
 Each question must be specific and answerable with evidence from the web.
+Do not invent numbers, intervals, capacities, battery sizes or other parameters that are not stated in the idea.
 Return ONLY JSON: {"questions": ["...", "..."]}. No markdown, no commentary.` },
       { role: "user", content: `Idea title: ${idea.title}\nDescription: ${idea.content}` }
     // JSON mode: in plain-text mode qwen3:4b leaks its reasoning instead of a list.
@@ -222,7 +232,40 @@ const FindingsSchema = z.object({
   }))
 });
 
-export type RankedChunk = { id: string; source_id: string; site: string; type: SourceType; text: string; url: string; score: number };
+export type RankedChunk = { id: string; source_id: string; site: string; type: SourceType; text: string; url: string; score: number; question?: number | null };
+
+export const boostFor = (c: { type: SourceType; site: string }) => BLOCKED_SITES.has(c.site) ? 0 : TYPE_BOOST[c.type];
+
+/**
+ * Per-question excerpt selection. Round-robin over questions: each round, every question takes its best
+ * remaining chunk (cosine to the question + type boost), skipping chunks already chosen and sites at the cap.
+ * Up to `perQuestion` chunks per question and `total` overall. Each chosen chunk is labeled with its question (1-based).
+ */
+export function selectPerQuestion(
+  chunks: Array<Omit<RankedChunk, "score" | "question"> & { vec: ArrayLike<number> }>,
+  questionVecs: ArrayLike<number>[], opts: { perQuestion: number; total: number; perSite: number }
+): RankedChunk[] {
+  const scored = questionVecs.map(qv => chunks
+    .map(c => ({ c, score: cosine(qv, c.vec) + boostFor(c) }))
+    .sort((a, b) => b.score - a.score));
+  const used = new Set<string>();
+  const perSite = new Map<string, number>();
+  const taken = questionVecs.map(() => 0);
+  const out: RankedChunk[] = [];
+  for (let round = 0; round < opts.perQuestion && out.length < opts.total; round++) {
+    for (let q = 0; q < questionVecs.length && out.length < opts.total; q++) {
+      if (taken[q]! > round) continue;
+      const pick = scored[q]!.find(s => !used.has(s.c.id) && (perSite.get(s.c.site) ?? 0) < opts.perSite);
+      if (!pick) continue;
+      used.add(pick.c.id);
+      perSite.set(pick.c.site, (perSite.get(pick.c.site) ?? 0) + 1);
+      taken[q]!++;
+      const { vec: _v, ...rest } = pick.c;
+      out.push({ ...rest, score: pick.score, question: q + 1 });
+    }
+  }
+  return out;
+}
 
 /** Highest-scoring chunks, at most `perSite` from any one site key, `total` overall. */
 export function selectTopChunks(chunks: RankedChunk[], total: number, perSite: number): RankedChunk[] {
@@ -265,44 +308,53 @@ export function normalizeForDedupe(s: string): string {
  */
 export async function checkSupport(
   idea: Idea, findings: Array<{ claim: string; quote: string; question?: string | null }>, deps: ResearchDeps
-): Promise<{ ratings: Rating[]; attempts: number; error: string | null }> {
+): Promise<{ ratings: Rating[]; attempts: number; error: string | null; raw?: string }> {
   if (findings.length === 0) return { ratings: [], attempts: 0, error: null };
   const items = findings.map((f, i) => ({ index: i + 1, ...f }));
   let error: string | null = null;
+  let lastRaw = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const raw = await deps.llm([
-        { role: "system", content: `For each item, rate two things.
-"supported":
-- "yes": the quote alone fully states the claim; nothing in the claim goes beyond the quote.
-- "partial": the quote supports only part of the claim, or the claim adds details, specifics or certainty not in the quote.
-- "no": the quote does not support the claim.
-"answers": does this claim help answer the item's QUESTION? "yes" only if the claim gives concrete evidence toward an answer.
-Generic, promotional or off-topic claims are "no". A claim about different hardware than the question asks about is "no".
-Be strict. Judge support only from the quote text.
+        { role: "system", content: `For each item, make two INDEPENDENT judgments.
+1. "supported" compares only CLAIM with QUOTE. Ignore the question for this judgment.
+- "yes": the quote states what the claim says; nothing in the claim goes beyond the quote.
+- "partial": the quote supports only part of the claim, or the claim adds details not in the quote.
+- "no": the quote does not say what the claim says.
+2. "answers" compares only CLAIM with QUESTION. Ignore whether the quote is good for this judgment.
+- "yes": the claim gives concrete information toward answering the question.
+- "no": the claim is generic, promotional, off-topic, or about different hardware than the question asks about.
+A claim can be supported but not answer the question, or answer the question but be unsupported.
 Return ONLY JSON: {"results": [{"index": N, "supported": "yes"|"partial"|"no", "answers": "yes"|"no"}]} with one entry per item.` },
         { role: "user", content: `IDEA: ${idea.title}\n${idea.content}\n\n` + items.map(it =>
           `ITEM ${it.index}\nQUESTION: ${it.question ?? `Is ${idea.title} feasible as described?`}\nCLAIM: ${it.claim}\nQUOTE: ${it.quote}`).join("\n\n") }
-      ], { format: "json", temperature: 0, numPredict: 600, numCtx: 4096 });
+      ], { format: "json", temperature: 0, numPredict: 600, numCtx: 4096, model: SYNTH_MODEL });
+      lastRaw = raw;
       const parsed = SupportSchema.parse(extractJsonObject(raw));
       const byIndex = new Map(parsed.results.map(r => [r.index, { supported: r.supported, answers: r.answers }]));
-      return { ratings: items.map(it => byIndex.get(it.index) ?? "unchecked"), attempts: attempt, error: null };
+      return { ratings: items.map(it => byIndex.get(it.index) ?? "unchecked"), attempts: attempt, error: null, raw: lastRaw };
     } catch (e) {
       error = String(e).slice(0, 300);
       deps.log?.(`support check attempt ${attempt} invalid: ${error.slice(0, 160)}`);
     }
   }
-  return { ratings: items.map(() => "unchecked" as const), attempts: 2, error };
+  return { ratings: items.map(() => "unchecked" as const), attempts: 2, error, raw: lastRaw };
 }
 
 export type VerifiedFinding = NewFinding & { question: number | null };
 
 export async function synthesize(idea: Idea, chunks: RankedChunk[], deps: ResearchDeps, questions: string[] = []) {
-  const numbered = chunks.map((c, i) => `[${i + 1}] (source: ${c.url})\n${c.text}`).join("\n\n");
+  // Truncate excerpts to the prompt budget; quotes are still verified against the full stored chunk.
+  let budget = LIMITS.maxExcerptTotalChars;
+  const numbered = chunks.map((c, i) => {
+    const text = c.text.slice(0, Math.max(0, Math.min(LIMITS.maxExcerptChars, budget)));
+    budget -= text.length;
+    const label = c.question ? `question ${c.question}, ` : "";
+    return `[${i + 1}] (${label}source: ${c.url})\n${text}`;
+  }).join("\n\n");
   const qBlock = questions.length ? `\n\nQUESTIONS:\n${questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}` : "";
-  const raw = await deps.llm([
-    { role: "system", content: `You extract evidence about an engineering idea from numbered source excerpts.
-Return ONLY JSON: {"findings": [{"claim": "...", "quote": "...", "chunk": N, "question": Q}]}
+  const system = `You extract evidence about an engineering idea from numbered source excerpts.
+${questions.length ? "Each excerpt was retrieved for one QUESTION, shown in its label. Findings from an excerpt should help answer that excerpt's question.\n" : ""}Return ONLY JSON: {"findings": [{"claim": "...", "quote": "...", "chunk": N}]}
 Rules:
 - "quote" MUST be copied verbatim, character for character, from excerpt N. Do not paraphrase, shorten with ellipses, or fix typos.
 - Each quote must be ONE contiguous sentence or fragment copied exactly as it appears in the excerpt.
@@ -310,14 +362,14 @@ Rules:
 - Keep each quote to one or two sentences.
 - Use each quote at most once. Never attach the same quote to two claims.
 - Prefer findings from different excerpts and sources; at most 2 findings per source.
-- Claims must be specific and directly about the idea (its hardware, approach and constraints), not generic marketing statements.
-- "claim" is a short factual statement that the quote directly supports and that is relevant to the idea.
+- "claim" is a short, specific factual statement that the quote directly supports. Do not add facts that are not in the quote.
 - "chunk" is the number of the excerpt containing the quote.
-${questions.length ? `- "question" is the number (integer) of the QUESTION the finding helps answer. Only include findings that help answer a question.` : `- Omit "question".`}
-- Use only the excerpts. If nothing is relevant, return {"findings": []}.
-- At most 8 findings. No markdown, no commentary.` },
-    { role: "user", content: `IDEA: ${idea.title}\n${idea.content}${qBlock}\n\nEXCERPTS:\n${numbered}` }
-  ], { format: "json", temperature: 0, numPredict: 1200, numCtx: 8192 });
+- Use only the excerpts. If an excerpt has nothing useful, skip it. If nothing is useful, return {"findings": []}.
+- At most 8 findings. No markdown, no commentary.`;
+  const user = `IDEA: ${idea.title}\n${idea.content}${qBlock}\n\nEXCERPTS:\n${numbered}`;
+  const raw = await deps.llm([{ role: "system", content: system }, { role: "user", content: user }],
+    { format: "json", temperature: 0, numPredict: 1200, numCtx: 8192, model: SYNTH_MODEL });
+  const diag = { promptChars: system.length + user.length, raw };
 
   const parsed = FindingsSchema.parse(extractJsonObject(raw));
   const kept: VerifiedFinding[] = [];
@@ -326,10 +378,10 @@ ${questions.length ? `- "question" is the number (integer) of the QUESTION the f
     const chunk = chunks[f.chunk - 1];
     if (!chunk) { dropped.push({ ...f, reason: "bad chunk number" }); continue; }
     if (!verifyQuote(chunk.text, f.quote)) { dropped.push({ ...f, reason: "quote not found verbatim" }); continue; }
-    const q = f.question !== undefined && f.question >= 1 && f.question <= questions.length ? f.question : null;
-    kept.push({ claim: f.claim, quote: f.quote, chunk_id: chunk.id, question: q });
+    // Question is assigned by code from the excerpt, not guessed by the model.
+    kept.push({ claim: f.claim, quote: f.quote, chunk_id: chunk.id, question: chunk.question ?? null });
   }
-  return { kept, dropped };
+  return { kept, dropped, diag };
 }
 
 export type SupportedFinding = VerifiedFinding & {
@@ -409,14 +461,18 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
     save.immediate();
     chunksEmbedded += batch.length;
   }
-  const [ideaVec] = await deps.embed([`${idea.title}\n${idea.content}`]);
-  const ranked: RankedChunk[] = chunkRows
-    .map(r => {
-      const meta = sourceMeta.get(r.source_id) ?? { site: r.source_id, type: "blog" as SourceType };
-      return { id: r.id, source_id: r.source_id, site: meta.site, type: meta.type, text: r.text,
-        url: sourceUrl.get(r.source_id) ?? "", score: cosine(ideaVec!, fromBlob(r.embedding!)) + TYPE_BOOST[meta.type] };
-    });
-  const top = selectTopChunks(ranked, LIMITS.topChunks, LIMITS.maxChunksPerSite);
+  // Idea text and every question embedded in one batch (through the lock in live deps).
+  const [ideaVec, ...questionVecs] = await deps.embed([`${idea.title}\n${idea.content}`, ...questions]);
+  const withVec = chunkRows.map(r => {
+    const meta = sourceMeta.get(r.source_id) ?? { site: r.source_id, type: "blog" as SourceType };
+    return { id: r.id, source_id: r.source_id, site: meta.site, type: meta.type, text: r.text,
+      url: sourceUrl.get(r.source_id) ?? "", vec: fromBlob(r.embedding!) };
+  });
+  const rankingMode = questions.length ? "per_question" : "idea";
+  const top: RankedChunk[] = questions.length
+    ? selectPerQuestion(withVec, questionVecs, { perQuestion: LIMITS.chunksPerQuestion, total: LIMITS.maxExcerpts, perSite: LIMITS.maxChunksPerSite })
+    : selectTopChunks(withVec.map(({ vec, ...c }) => ({ ...c, score: cosine(ideaVec!, vec) + boostFor(c), question: null })),
+        LIMITS.topChunks, LIMITS.maxChunksPerSite);
   t = mark("embed_ms", t);
   ensureOwned();
 
@@ -424,8 +480,9 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
   let kept: VerifiedFinding[] = [];
   let dropped: Array<{ claim: string; quote: string; chunk: number; reason: string }> = [];
   let synthesisError: string | null = null;
+  let synthDiag: { promptChars: number; raw: string } | null = null;
   if (top.length) {
-    try { ({ kept, dropped } = await synthesize(idea, top, deps, questions)); }
+    try { ({ kept, dropped, diag: synthDiag } = await synthesize(idea, top, deps, questions)); }
     catch (e) { synthesisError = String(e).slice(0, 300); log(`synthesis failed: ${synthesisError}`); }
   }
   t = mark("synthesis_ms", t);
@@ -486,6 +543,14 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
       droppedUnchecked: count("unchecked"), droppedLowRelevance: count("low_relevance"), droppedSourceCap: count("source_cap"),
       supportAttempts: support.attempts, supportError: support.error,
       findingsKept: accepted.length, synthesisError,
+      synthModel: SYNTH_MODEL, rankingMode,
+      excerpts: top.map((c, i) => ({ n: i + 1, question: c.question ?? null, site: c.site, type: c.type, url: c.url, score: Number(c.score.toFixed(4)) })),
+      // Diagnostics when nothing was kept: prompt size and raw model outputs (truncated).
+      ...(accepted.length === 0 ? { diagnostics: {
+        synthesisPromptChars: synthDiag?.promptChars ?? null,
+        synthesisRaw: synthDiag?.raw.slice(0, 4000) ?? null,
+        supportRaw: support.raw?.slice(0, 2000) ?? null
+      } } : {}),
       findingsDetail: checked.map(f => ({
         claim: f.claim, url: f.url, site: f.site, type: f.type, question: f.question, questionText: qText(f),
         support: f.rating === "unchecked" ? "unchecked" : f.rating.supported,

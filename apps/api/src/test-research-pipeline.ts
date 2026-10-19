@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { ensureResearchTables } from "./research-schema.js";
 import { sha256, verifyQuote, type FetchResult } from "./research-sources.js";
-import { runResearch, pickCandidates, selectTopChunks, siteKey, sourceType, parseQuestions, type ResearchDeps, type ChatMessage } from "./research.js";
+import { runResearch, pickCandidates, selectTopChunks, selectPerQuestion, boostFor, siteKey, sourceType, parseQuestions, SYNTH_MODEL, type ResearchDeps, type ChatMessage } from "./research.js";
 import { createResearchJobStore, ActiveResearchJobError, LeaseLostError, type ResearchJob } from "./research-jobs.js";
 
 const dbPath = process.env.BRAIN_DB;
@@ -58,8 +58,11 @@ const fakeSearch = (q: string) => Promise.resolve([
 const KEYS = ["lora", "battery", "sensor", "sleep", "tomato"];
 const fakeEmbed = (texts: string[]) => Promise.resolve(texts.map(t => KEYS.map(k => (t.toLowerCase().split(k).length - 1) + 0.01)));
 
-function fakeLlm(messages: ChatMessage[]): Promise<string> {
+const modelCalls: Array<{ kind: string; model: string | undefined }> = [];
+function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promise<string> {
   const sys = messages[0]!.content;
+  modelCalls.push({ kind: sys.includes("open questions") ? "questions" : sys.includes("write web search queries") ? "queries"
+    : sys.includes("INDEPENDENT judgments") ? "judge" : "synthesis", model: opts.model });
   if (sys.includes("open questions")) {
     return Promise.resolve(llmMode === "garbage" ? "I cannot help with that."
       : JSON.stringify({ questions: ["How long can a LoRa sensor run on battery?", "What deep sleep current does the ESP32-S3 draw?", "What range does LoRa reach?"] }));
@@ -68,7 +71,7 @@ function fakeLlm(messages: ChatMessage[]): Promise<string> {
     return Promise.resolve(llmMode === "badQueries" ? "not json"
       : JSON.stringify({ queries: ["LoRa sensor battery life", "ESP32-S3 deep sleep current", "LoRa range"] }));
   }
-  if (sys.includes('"answers": does this claim help answer')) {
+  if (sys.includes("INDEPENDENT judgments")) {
     supportCalls++;
     const claimsIn = [...messages[1]!.content.matchAll(/^CLAIM: (.*)$/gm)].map(m => m[1]!);
     const n = claimsIn.length;
@@ -79,9 +82,9 @@ function fakeLlm(messages: ChatMessage[]): Promise<string> {
   }
   // Synthesis: quote the first sentence of excerpt 1 verbatim, plus a fabricated quote and a bad chunk number.
   const user = messages[1]!.content;
-  const m = /\[1\] \(source: [^)]*\)\n([^\n]*)/.exec(user)!;
+  const m = /\[1\] \([^)]*\)\n([^\n]*)/.exec(user)!;
   const firstSentence = m[1]!.split(/(?<=\.)\s/)[0]!;
-  const excerpts = [...user.matchAll(/\[(\d+)\] \(source: [^)]*\)\n([^\n]*)/g)].map(x => ({ n: Number(x[1]), sentences: x[2]!.split(/(?<=\.)\s/) }));
+  const excerpts = [...user.matchAll(/\[(\d+)\] \([^)]*\)\n([^\n]*)/g)].map(x => ({ n: Number(x[1]), sentences: x[2]!.split(/(?<=\.)\s/) }));
   if (synthMode === "claimVariant") {
     return Promise.resolve(JSON.stringify({ findings: [
       { claim: "  SUPPORTED   claim!! ", quote: excerpts[0]!.sentences[1]!, chunk: 1 }
@@ -99,7 +102,7 @@ function fakeLlm(messages: ChatMessage[]): Promise<string> {
     ] }));
   }
   return Promise.resolve(JSON.stringify({ findings: [
-    { claim: "Supported claim", quote: firstSentence, chunk: 1, question: 1 },
+    { claim: "Supported claim", quote: firstSentence, chunk: 1, question: 99 },
     { claim: "Fabricated claim", quote: "LoRa reaches 500 km in every city.", chunk: 1 },
     { claim: "Bad index", quote: firstSentence, chunk: 99 }
   ] }));
@@ -150,6 +153,42 @@ try {
   check("parseQuestions: numbered/bulleted lines, dedupe", JSON.stringify(parseQuestions("Here:\n1. What range is achievable?\n2) **How much power is used?**\n- What range is achievable?\nnoise")) ===
     JSON.stringify(["What range is achievable?", "How much power is used?"]));
 
+  // Per-question selection
+  const v = (...x: number[]) => x;
+  const pc = [
+    { id: "c1", source_id: "s1", site: "s1", type: "blog" as const, text: "", url: "", vec: v(1, 0, 0) },
+    { id: "c2", source_id: "s1", site: "s1", type: "blog" as const, text: "", url: "", vec: v(0.9, 0.1, 0) },
+    { id: "c3", source_id: "s2", site: "s2", type: "blog" as const, text: "", url: "", vec: v(0.8, 0.2, 0) },
+    { id: "c4", source_id: "s3", site: "s3", type: "blog" as const, text: "", url: "", vec: v(0, 1, 0) },
+    { id: "c5", source_id: "s4", site: "s4", type: "blog" as const, text: "", url: "", vec: v(0, 0.9, 0.1) },
+    { id: "c6", source_id: "s5", site: "s5", type: "blog" as const, text: "", url: "", vec: v(0, 0, 1) }
+  ];
+  const pq = selectPerQuestion(pc, [v(1, 0, 0), v(1, 0, 0), v(0, 1, 0)], { perQuestion: 2, total: 5, perSite: 2 });
+  check("per-question: round-robin, labeled by question, no duplicate chunks", JSON.stringify(pq.map(c => `${c.question}:${c.id}`)) ===
+    JSON.stringify(["1:c1", "2:c2", "3:c4", "1:c3", "2:c5"]) && new Set(pq.map(c => c.id)).size === pq.length, pq.map(c => `${c.question}:${c.id}`));
+  const pqSite = selectPerQuestion(pc, [v(1, 0, 0)], { perQuestion: 3, total: 8, perSite: 1 });
+  check("per-question: per-site cap respected", JSON.stringify(pqSite.map(c => c.id)) === JSON.stringify(["c1", "c3", "c4"]), pqSite.map(c => c.id));
+  const blocked = pickCandidates([[{ url: "https://www.researchgate.net/publication/1", title: "" }, { url: "https://dl.acm.org/doi/1", title: "" }, { url: "https://someblog.com/a", title: "" }]], 10);
+  check("blocked sites deprioritized after blogs", JSON.stringify(blocked.map(c => c.site)) === JSON.stringify(["someblog", "researchgate", "acm"]), blocked.map(c => c.site));
+  check("blocked sites get no type boost", boostFor({ type: "paper", site: "researchgate" }) === 0 && boostFor({ type: "paper", site: "nih" }) > 0);
+
+  // generateResponse default model unchanged, override passed through (fetch intercepted, no Ollama call)
+  {
+    const realFetch = globalThis.fetch;
+    const bodies: any[] = [];
+    globalThis.fetch = (async (_u: any, init: any) => {
+      bodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ message: { content: "ok" }, done_reason: "stop" }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { generateResponse } = await import("./ai.js");
+      await generateResponse([{ role: "user", content: "x" }]);
+      await generateResponse([{ role: "user", content: "x" }], { model: "gemma4:e4b-it-qat", numCtx: 8192 });
+    } finally { globalThis.fetch = realFetch; }
+    check("generateResponse default model is qwen3:4b, num_ctx 2048", bodies[0]?.model === "qwen3:4b" && bodies[0]?.options.num_ctx === 2048, bodies[0]?.model);
+    check("generateResponse model override passed through", bodies[1]?.model === "gemma4:e4b-it-qat" && bodies[1]?.options.num_ctx === 8192, bodies[1]?.model);
+  }
+
   // Per-source cap unit
   const mk = (src: string, score: number) => ({ id: `${src}-${score}`, source_id: `${src}-id`, site: src, type: "blog" as const, text: "", url: "", score });
   const sel = selectTopChunks([mk("s1", 0.99), mk("s1", 0.98), mk("s1", 0.97), mk("s1", 0.96), mk("s2", 0.5), mk("s2", 0.4), mk("s2", 0.3), mk("s3", 0.1), mk("s4", 0.05)], 6, 2);
@@ -169,7 +208,11 @@ try {
   const j1 = claimFor(job1);
   const r1 = await runResearch(db, idea, deps({ stillOwned: () => store.owns(j1) }));
   check("questions generated then one query per question", r1.result.questions.length === 3 && r1.result.queries.length === 3 && !r1.result.queryFallback && r1.result.queryFallbackKind === "none", r1.result.questions);
-  check("finding mapped to question text", r1.result.findingsDetail[0]?.question === 1 && r1.result.findingsDetail[0]?.questionText === r1.result.questions[0], r1.result.findingsDetail[0]);
+  check("finding question assigned from its excerpt (model's 99 ignored)", r1.result.findingsDetail[0]?.question === r1.result.excerpts[0]?.question && r1.result.findingsDetail[0]?.question === 1 && r1.result.findingsDetail[0]?.questionText === r1.result.questions[0], r1.result.findingsDetail[0]);
+  check("per-question ranking used; excerpts labeled by question", r1.result.rankingMode === "per_question" && r1.result.excerpts.every(e => e.question !== null), r1.result.excerpts.map(e => e.question));
+  const kinds = (k: string) => modelCalls.filter(c => c.kind === k).map(c => c.model);
+  check("synth + judge use SYNTH_MODEL; questions + queries use default", kinds("synthesis").length > 0 && kinds("synthesis").every(m => m === SYNTH_MODEL) &&
+    kinds("judge").every(m => m === SYNTH_MODEL) && kinds("questions").every(m => m === undefined) && kinds("queries").every(m => m === undefined), { synth: kinds("synthesis")[0], judge: kinds("judge")[0], q: kinds("questions")[0] });
   check("result JSON has source type/site and distinct sites", r1.result.distinctSites === 3 && r1.result.sourcesDetail.every(d => d.type === "blog" && d.site.length > 0), r1.result.sourcesDetail.map(d => d.site));
   check("fetched sources (dedupe, ftp skipped, 404 recorded)", r1.result.fetched === 3 && r1.result.fetchFailed === 1 && !fetchCalls.some(u => u.startsWith("ftp")), { fetched: r1.result.fetched, fetchFailed: r1.result.fetchFailed, calls: fetchCalls });
   check("404 source stored with error", (db.prepare(`SELECT error FROM research_sources WHERE idea_id = ? AND url = 'https://missing.example/404'`).get(ideaId) as any)?.error === "HTTP 404");
@@ -195,6 +238,7 @@ try {
   // Bad LLM JSON -> fallback to idea title
   llmMode = "garbage";
   const r3 = await runResearch(db, idea, deps());
+  check("no questions -> idea-text ranking fallback", r3.result.rankingMode === "idea" && r3.result.excerpts.every(e => e.question === null));
   check("bad query JSON falls back to idea title", r3.result.queryFallback && JSON.stringify(r3.result.queries) === JSON.stringify([idea.title]), r3.result.queries);
   llmMode = "badQueries";
   const r3b = await runResearch(db, idea, deps());
@@ -224,7 +268,7 @@ try {
   check("reused quote dropped (first use kept)", rm.result.droppedReusedQuote === 1 && outcome("multi A1") === "kept" && !rm.checked.some(f => f.claim === "multi reused"), rm.result.droppedReusedQuote);
   check("per-source kept cap (max 2 per source)", rm.result.droppedSourceCap === 1 && outcome("multi A3") === "source_cap" && outcome("multi A2") === "kept");
   check("claim not answering its question dropped", rm.result.droppedLowRelevance === 1 && outcome("multi B [low]") === "low_relevance");
-  check("claim answering its question kept (question \"Q3\" coerced to 3)", outcome("multi C [medium]") === "kept" && rm.checked.find(f => f.claim === "multi C [medium]")?.question === 3);
+  check("claim answering its question kept", outcome("multi C [medium]") === "kept");
   check("multi run keeps exactly A1, A2, C", JSON.stringify(rm.findings.map(f => f.claim)) === JSON.stringify(["multi A1", "multi A2", "multi C [medium]"]), rm.findings.map(f => f.claim));
 
   // Claim dedupe across runs: different quote, same normalized claim
