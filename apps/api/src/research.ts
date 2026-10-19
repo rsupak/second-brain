@@ -23,7 +23,8 @@ export type ResearchDeps = {
   stillOwned?: () => boolean;
 };
 
-export const LIMITS = { maxQueries: 5, maxSources: 5, maxCandidates: 10, topChunks: 6, maxChunksPerSource: 2, embedBatch: 16 };
+export const LIMITS = { maxQueries: 5, maxSources: 5, maxCandidates: 10, topChunks: 6, maxChunksPerSource: 2, maxFindingsPerSource: 2, embedBatch: 16,
+  allowedRelevance: ["high", "medium"] as Relevance[] };
 
 export type Idea = { id: string; title: string; content: string };
 
@@ -134,44 +135,57 @@ export function selectTopChunks(chunks: RankedChunk[], total: number, perSource:
 const SupportSchema = z.object({
   results: z.array(z.object({
     index: z.number().int(),
-    supported: z.enum(["yes", "partial", "no"])
+    supported: z.enum(["yes", "partial", "no"]),
+    relevance: z.enum(["high", "medium", "low"])
   }))
 });
 
 export type SupportLevel = "yes" | "partial" | "no";
+export type Relevance = "high" | "medium" | "low";
+export type Rating = { supported: SupportLevel; relevance: Relevance } | "unchecked";
+
+/** Case/whitespace/punctuation-insensitive form used for claim and quote dedupe. */
+export function normalizeForDedupe(s: string): string {
+  return s.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
 
 /**
- * One batched LLM call rating each claim against its quote.
+ * One batched LLM call rating each claim against its quote (support) and against the idea (relevance).
  * Invalid output is retried once; if still invalid, every finding is "unchecked" (dropped by the caller).
  * A finding the model does not rate is also "unchecked".
  */
 export async function checkSupport(
-  findings: Array<{ claim: string; quote: string }>, deps: ResearchDeps
-): Promise<{ levels: Array<SupportLevel | "unchecked">; attempts: number; error: string | null }> {
-  if (findings.length === 0) return { levels: [], attempts: 0, error: null };
+  idea: Idea, findings: Array<{ claim: string; quote: string }>, deps: ResearchDeps
+): Promise<{ ratings: Rating[]; attempts: number; error: string | null }> {
+  if (findings.length === 0) return { ratings: [], attempts: 0, error: null };
   const items = findings.map((f, i) => ({ index: i + 1, claim: f.claim, quote: f.quote }));
   let error: string | null = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const raw = await deps.llm([
-        { role: "system", content: `You rate whether each quote supports its claim.
-For each item answer:
+        { role: "system", content: `You rate whether each quote supports its claim, and how relevant the claim is to an idea.
+"supported":
 - "yes": the quote alone fully states the claim; nothing in the claim goes beyond the quote.
 - "partial": the quote supports only part of the claim, or the claim adds details, specifics or certainty not in the quote.
 - "no": the quote does not support the claim.
-Be strict. Judge only from the quote text.
-Return ONLY JSON: {"results": [{"index": N, "supported": "yes"|"partial"|"no"}]} with one entry per item.` },
-        { role: "user", content: items.map(it => `ITEM ${it.index}\nCLAIM: ${it.claim}\nQUOTE: ${it.quote}`).join("\n\n") }
-      ], { format: "json", temperature: 0, numPredict: 400, numCtx: 4096 });
+"relevance" of the claim to the IDEA:
+- "high": directly informs building or evaluating this idea.
+- "medium": useful background for this idea.
+- "low": generic, marketing-like, or off-topic. If the idea names specific hardware or versions, a claim about a different model or version is "low".
+Be strict. Judge support only from the quote text.
+Return ONLY JSON: {"results": [{"index": N, "supported": "yes"|"partial"|"no", "relevance": "high"|"medium"|"low"}]} with one entry per item.` },
+        { role: "user", content: `IDEA: ${idea.title}\n${idea.content}\n\n` +
+          items.map(it => `ITEM ${it.index}\nCLAIM: ${it.claim}\nQUOTE: ${it.quote}`).join("\n\n") }
+      ], { format: "json", temperature: 0, numPredict: 600, numCtx: 4096 });
       const parsed = SupportSchema.parse(extractJsonObject(raw));
-      const byIndex = new Map(parsed.results.map(r => [r.index, r.supported]));
-      return { levels: items.map(it => byIndex.get(it.index) ?? "unchecked"), attempts: attempt, error: null };
+      const byIndex = new Map(parsed.results.map(r => [r.index, { supported: r.supported, relevance: r.relevance }]));
+      return { ratings: items.map(it => byIndex.get(it.index) ?? "unchecked"), attempts: attempt, error: null };
     } catch (e) {
       error = String(e).slice(0, 300);
       deps.log?.(`support check attempt ${attempt} invalid: ${error.slice(0, 160)}`);
     }
   }
-  return { levels: items.map(() => "unchecked"), attempts: 2, error };
+  return { ratings: items.map(() => "unchecked" as const), attempts: 2, error };
 }
 
 export async function synthesize(idea: Idea, chunks: RankedChunk[], deps: ResearchDeps) {
@@ -184,6 +198,9 @@ Rules:
 - Each quote must be ONE contiguous sentence or fragment copied exactly as it appears in the excerpt.
 - Never merge list items, bullet points or separate lines into one quote; never add or remove punctuation.
 - Keep each quote to one or two sentences.
+- Use each quote at most once. Never attach the same quote to two claims.
+- Prefer findings from different excerpts and sources; at most 2 findings per source.
+- Claims must be specific and directly about the idea (its hardware, approach and constraints), not generic marketing statements.
 - "claim" is a short factual statement that the quote directly supports and that is relevant to the idea.
 - "chunk" is the number of the excerpt containing the quote.
 - Use only the excerpts. If nothing is relevant, return {"findings": []}.
@@ -203,7 +220,7 @@ Rules:
   return { kept, dropped };
 }
 
-export type SupportedFinding = NewFinding & { support: SupportLevel | "unchecked" };
+export type SupportedFinding = NewFinding & { source_id: string; rating: Rating; outcome: string };
 
 // ---------- full pipeline ----------
 
@@ -289,17 +306,44 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
   t = mark("synthesis_ms", t);
   ensureOwned();
 
-  // 6. Claim support check: keep only "yes"
-  const support = await checkSupport(kept, deps);
-  const checked: SupportedFinding[] = kept.map((f, i) => ({ ...f, support: support.levels[i]! }));
-  const accepted = checked.filter(f => f.support === "yes");
-  const rejected = checked.filter(f => f.support !== "yes");
+  // 6a. Quote reuse: keep only the first use of a quote
+  const seenQuotes = new Set<string>();
+  const unique: NewFinding[] = [];
+  let droppedReusedQuote = 0;
+  for (const f of kept) {
+    const key = normalizeForDedupe(f.quote);
+    if (seenQuotes.has(key)) { droppedReusedQuote++; continue; }
+    seenQuotes.add(key);
+    unique.push(f);
+  }
+
+  // 6b. Support + relevance check (one call), keep supported=yes AND allowed relevance
+  const support = await checkSupport(idea, unique, deps);
+  const sourceOf = new Map(top.map(c => [c.id, c.source_id]));
+  const perSource = new Map<string, number>();
+  const checked: SupportedFinding[] = unique.map((f, i) => {
+    const rating = support.ratings[i]!;
+    const source_id = sourceOf.get(f.chunk_id) ?? "";
+    let outcome: string;
+    if (rating === "unchecked") outcome = "unchecked";
+    else if (rating.supported === "no") outcome = "unsupported";
+    else if (rating.supported === "partial") outcome = "partial";
+    else if (!LIMITS.allowedRelevance.includes(rating.relevance)) outcome = "low_relevance";
+    else {
+      // 6c. Per-source cap on kept findings, in model order
+      const n = perSource.get(source_id) ?? 0;
+      outcome = n >= LIMITS.maxFindingsPerSource ? "source_cap" : "kept";
+      if (outcome === "kept") perSource.set(source_id, n + 1);
+    }
+    return { ...f, source_id, rating, outcome };
+  });
+  const accepted = checked.filter(f => f.outcome === "kept");
   mark("support_ms", t);
   timings.total_ms = Date.now() - t0;
 
-  const count = (lvl: string) => rejected.filter(f => f.support === lvl).length;
+  const count = (o: string) => checked.filter(f => f.outcome === o).length;
   return {
-    findings: accepted.map(({ support: _s, ...f }) => f),
+    findings: accepted.map(f => ({ claim: f.claim, quote: f.quote, chunk_id: f.chunk_id })),
     checked,
     dropped,
     result: {
@@ -308,7 +352,8 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
       chunksTotal: chunkRows.length, chunksEmbedded, rankedChunks: top.length,
       rankedSources: new Set(top.map(c => c.source_id)).size,
       quotesVerified: kept.length, findingsDropped: dropped.length,
-      droppedUnsupported: count("no"), droppedPartial: count("partial"), droppedUnchecked: count("unchecked"),
+      droppedReusedQuote, droppedUnsupported: count("unsupported"), droppedPartial: count("partial"),
+      droppedUnchecked: count("unchecked"), droppedLowRelevance: count("low_relevance"), droppedSourceCap: count("source_cap"),
       supportAttempts: support.attempts, supportError: support.error,
       findingsKept: accepted.length, synthesisError, timings
     }

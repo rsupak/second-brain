@@ -5,6 +5,11 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 
+/** Case/whitespace/punctuation-insensitive claim key (same as research.ts normalizeForDedupe). */
+export function normalizeClaim(s: string): string {
+  return s.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
 export const JOB_TYPE = "research_idea";
 export const MAX_ATTEMPTS = 3;
 export const LEASE_MS = 20 * 60 * 1000;
@@ -84,6 +89,8 @@ export function createResearchJobStore(db: Database.Database) {
     SELECT 1 FROM research_findings WHERE idea_id = ? AND chunk_id = ? AND quote = ?
   `);
 
+  const existingClaims = db.prepare(`SELECT claim FROM research_findings WHERE idea_id = ?`).pluck();
+
   const insertFinding = db.prepare(`
     INSERT INTO research_findings (id, idea_id, claim, quote, chunk_id, verified, created_at)
     VALUES (?, ?, ?, ?, ?, 1, ?)
@@ -132,14 +139,18 @@ export function createResearchJobStore(db: Database.Database) {
     job: ResearchJob, ideaId: string, findings: NewFinding[], result: Record<string, unknown>
   ) => {
     if (!checkOwnership.get(job.id, job.lease_owner, Date.now())) throw new LeaseLostError();
-    let inserted = 0, duplicates = 0;
+    let inserted = 0, duplicates = 0, duplicateClaims = 0;
     const now = Date.now();
+    const claims = new Set((existingClaims.all(ideaId) as string[]).map(normalizeClaim));
     for (const f of findings) {
       if (findDuplicate.get(ideaId, f.chunk_id, f.quote)) { duplicates++; continue; }
+      const key = normalizeClaim(f.claim);
+      if (claims.has(key)) { duplicates++; duplicateClaims++; continue; }
+      claims.add(key);
       insertFinding.run(randomUUID(), ideaId, f.claim, f.quote, f.chunk_id, now);
       inserted++;
     }
-    const full = { ...result, findingsInserted: inserted, findingsDuplicate: duplicates };
+    const full = { ...result, findingsInserted: inserted, findingsDuplicate: duplicates, findingsDuplicateClaim: duplicateClaims };
     const done = markCompleted.run(JSON.stringify(full), job.id, job.lease_owner);
     if (done.changes !== 1) throw new LeaseLostError("Job completion did not match the lease owner");
     return full;

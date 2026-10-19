@@ -35,6 +35,7 @@ const PAGES: Record<string, string> = {
 let llmMode: "good" | "garbage" = "good";
 let supportMode: "yes" | "partial" | "no" | "bad" | "bad-once" = "yes";
 let supportCalls = 0;
+let synthMode: "default" | "multi" | "claimVariant" = "default";
 const fetchCalls: string[] = [];
 
 function fakeFetch(url: string): Promise<FetchResult> {
@@ -65,15 +66,34 @@ function fakeLlm(messages: ChatMessage[]): Promise<string> {
   }
   if (sys.includes("rate whether each quote supports")) {
     supportCalls++;
-    const n = (messages[1]!.content.match(/^ITEM \d+/gm) ?? []).length;
+    const claimsIn = [...messages[1]!.content.matchAll(/^CLAIM: (.*)$/gm)].map(m => m[1]!);
+    const n = claimsIn.length;
+    const rel = (c: string) => c.includes("[low]") ? "low" : c.includes("[medium]") ? "medium" : "high";
     if (supportMode === "bad" || (supportMode === "bad-once" && supportCalls === 1)) return Promise.resolve("I think they are fine");
     const level = supportMode === "bad-once" ? "yes" : supportMode;
-    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level })) }));
+    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level, relevance: rel(claimsIn[i]!) })) }));
   }
   // Synthesis: quote the first sentence of excerpt 1 verbatim, plus a fabricated quote and a bad chunk number.
   const user = messages[1]!.content;
   const m = /\[1\] \(source: [^)]*\)\n([^\n]*)/.exec(user)!;
   const firstSentence = m[1]!.split(/(?<=\.)\s/)[0]!;
+  const excerpts = [...user.matchAll(/\[(\d+)\] \(source: [^)]*\)\n([^\n]*)/g)].map(x => ({ n: Number(x[1]), sentences: x[2]!.split(/(?<=\.)\s/) }));
+  if (synthMode === "claimVariant") {
+    return Promise.resolve(JSON.stringify({ findings: [
+      { claim: "  SUPPORTED   claim!! ", quote: excerpts[0]!.sentences[1]!, chunk: 1 }
+    ] }));
+  }
+  if (synthMode === "multi") {
+    const [e1, e2, e3] = excerpts;
+    return Promise.resolve(JSON.stringify({ findings: [
+      { claim: "multi A1", quote: e1!.sentences[0], chunk: e1!.n },
+      { claim: "multi A2", quote: e1!.sentences[1], chunk: e1!.n },
+      { claim: "multi A3", quote: e1!.sentences[2], chunk: e1!.n },
+      { claim: "multi reused", quote: e1!.sentences[0], chunk: e1!.n },
+      { claim: "multi B [low]", quote: e2!.sentences[0], chunk: e2!.n },
+      { claim: "multi C [medium]", quote: e3!.sentences[0], chunk: e3!.n }
+    ] }));
+  }
   return Promise.resolve(JSON.stringify({ findings: [
     { claim: "Supported claim", quote: firstSentence, chunk: 1 },
     { claim: "Fabricated claim", quote: "LoRa reaches 500 km in every city.", chunk: 1 },
@@ -165,6 +185,27 @@ try {
   const rRetry = await runResearch(db, idea, deps());
   check("bad support JSON once: retry succeeds and keeps 'yes'", rRetry.findings.length === 1 && rRetry.result.supportAttempts === 2 && rRetry.result.droppedUnchecked === 0);
   supportMode = "yes";
+
+  // Quote reuse, per-source kept cap, relevance
+  synthMode = "multi";
+  const rm = await runResearch(db, idea, deps());
+  synthMode = "default";
+  const outcome = (c: string) => rm.checked.find(f => f.claim === c)?.outcome;
+  check("reused quote dropped (first use kept)", rm.result.droppedReusedQuote === 1 && outcome("multi A1") === "kept" && !rm.checked.some(f => f.claim === "multi reused"), rm.result.droppedReusedQuote);
+  check("per-source kept cap (max 2 per source)", rm.result.droppedSourceCap === 1 && outcome("multi A3") === "source_cap" && outcome("multi A2") === "kept");
+  check("low relevance dropped", rm.result.droppedLowRelevance === 1 && outcome("multi B [low]") === "low_relevance");
+  check("medium relevance kept", outcome("multi C [medium]") === "kept");
+  check("multi run keeps exactly A1, A2, C", JSON.stringify(rm.findings.map(f => f.claim)) === JSON.stringify(["multi A1", "multi A2", "multi C [medium]"]), rm.findings.map(f => f.claim));
+
+  // Claim dedupe across runs: different quote, same normalized claim
+  synthMode = "claimVariant";
+  const jobCv = store.enqueue(ideaId);
+  const jcv = claimFor(jobCv);
+  const rcv = await runResearch(db, idea, deps());
+  synthMode = "default";
+  const before = findingCount();
+  const dcv = store.complete(jcv, ideaId, rcv.findings, rcv.result);
+  check("claim dedupe across runs (case/space/punctuation-insensitive)", rcv.findings.length === 1 && dcv.findingsDuplicateClaim === 1 && dcv.findingsInserted === 0 && findingCount() === before, dcv);
 
   // SourceInUse: content changed but findings reference chunks -> keep existing
   const chunkIdsBefore = db.prepare(`SELECT c.id FROM research_chunks c JOIN research_sources s ON s.id = c.source_id WHERE s.idea_id = ? ORDER BY c.id`).pluck().all(ideaId);
