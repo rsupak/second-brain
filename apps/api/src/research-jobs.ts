@@ -33,7 +33,7 @@ export class LeaseLostError extends Error {
 }
 
 export class ActiveResearchJobError extends Error {
-  constructor(ideaId: string, jobId: string) {
+  constructor(ideaId: string, readonly jobId: string) {
     super(`Idea ${ideaId} already has an active research job (${jobId})`);
     this.name = "ActiveResearchJobError";
   }

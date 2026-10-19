@@ -22,6 +22,8 @@ import {
   queueEvaluations,
   listEvaluations
 } from "./evaluations.js";
+import Database from "better-sqlite3";
+import { researchRoutes } from "./research-routes.js";
 
 const app = Fastify({ logger: true });
 
@@ -198,6 +200,13 @@ app.get("/evaluations/status", async () => {
     db.close();
   }
 });
+
+// Research API + dashboard (own connection; BRAIN_DB honoured, same default path).
+const researchDb = new Database(process.env.BRAIN_DB ?? "./data/brain.sqlite");
+researchDb.pragma("journal_mode = WAL");
+researchDb.pragma("foreign_keys = ON");
+researchDb.pragma("busy_timeout = 5000");
+app.register(researchRoutes, { db: researchDb });
 
 async function start() {
   try {
