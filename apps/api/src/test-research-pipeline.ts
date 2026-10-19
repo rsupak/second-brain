@@ -35,7 +35,8 @@ const PAGES: Record<string, string> = {
 let llmMode: "good" | "garbage" | "badQueries" = "good";
 let supportMode: "yes" | "partial" | "no" | "bad" | "bad-once" = "yes";
 let supportCalls = 0;
-let synthMode: "default" | "multi" | "claimVariant" = "default";
+let synthMode: "default" | "multi" | "claimVariant" | "judgeCases" = "default";
+let lastSynthSystem = "";
 const fetchCalls: string[] = [];
 
 function fakeFetch(url: string): Promise<FetchResult> {
@@ -75,11 +76,13 @@ function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promis
     supportCalls++;
     const claimsIn = [...messages[1]!.content.matchAll(/^CLAIM: (.*)$/gm)].map(m => m[1]!);
     const n = claimsIn.length;
-    const ans = (c: string) => c.includes("[low]") ? "no" : "yes";
+    const jq = (c: string) => c.includes("[low]") || c.includes("[q0]") ? 0 : c.includes("[q9]") ? 9 : c === "Supported claim" ? 2 : 1;
+    const hw = (c: string) => c.includes("[diff]") ? "different" : c.includes("[rel]") ? "related" : "same";
     if (supportMode === "bad" || (supportMode === "bad-once" && supportCalls === 1)) return Promise.resolve("I think they are fine");
     const level = supportMode === "bad-once" ? "yes" : supportMode;
-    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level, answers: ans(claimsIn[i]!) })) }));
+    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level, question: jq(claimsIn[i]!), hardware: hw(claimsIn[i]!) })) }));
   }
+  lastSynthSystem = sys;
   // Synthesis: quote the first sentence of excerpt 1 verbatim, plus a fabricated quote and a bad chunk number.
   const user = messages[1]!.content;
   const m = /\[1\] \([^)]*\)\n([^\n]*)/.exec(user)!;
@@ -88,6 +91,15 @@ function fakeLlm(messages: ChatMessage[], opts: { model?: string } = {}): Promis
   if (synthMode === "claimVariant") {
     return Promise.resolve(JSON.stringify({ findings: [
       { claim: "  SUPPORTED   claim!! ", quote: excerpts[0]!.sentences[1]!, chunk: 1 }
+    ] }));
+  }
+  if (synthMode === "judgeCases") {
+    const [e1, e2, e3] = excerpts;
+    return Promise.resolve(JSON.stringify({ findings: [
+      { claim: "jc none [q0]", quote: e1!.sentences[0], chunk: e1!.n },
+      { claim: "jc out of range [q9]", quote: e2!.sentences[0], chunk: e2!.n },
+      { claim: "jc different board [diff]", quote: e3!.sentences[0], chunk: e3!.n },
+      { claim: "jc related board [rel]", quote: e1!.sentences[1], chunk: e1!.n }
     ] }));
   }
   if (synthMode === "multi") {
@@ -208,7 +220,9 @@ try {
   const j1 = claimFor(job1);
   const r1 = await runResearch(db, idea, deps({ stillOwned: () => store.owns(j1) }));
   check("questions generated then one query per question", r1.result.questions.length === 3 && r1.result.queries.length === 3 && !r1.result.queryFallback && r1.result.queryFallbackKind === "none", r1.result.questions);
-  check("finding question assigned from its excerpt (model's 99 ignored)", r1.result.findingsDetail[0]?.question === r1.result.excerpts[0]?.question && r1.result.findingsDetail[0]?.question === 1 && r1.result.findingsDetail[0]?.questionText === r1.result.questions[0], r1.result.findingsDetail[0]);
+  const fd0 = r1.result.findingsDetail[0];
+  check("judge-chosen question overrides excerpt question (excerpt kept, labeled)", fd0?.excerptQuestion === 1 && fd0?.judgeQuestion === 2 && fd0?.judgeQuestionText === r1.result.questions[1] && fd0?.outcome === "kept", fd0);
+  check("synthesis prompt requires claims to name the board", lastSynthSystem.includes("must name that exact board"));
   check("per-question ranking used; excerpts labeled by question", r1.result.rankingMode === "per_question" && r1.result.excerpts.every(e => e.question !== null), r1.result.excerpts.map(e => e.question));
   const kinds = (k: string) => modelCalls.filter(c => c.kind === k).map(c => c.model);
   check("synth + judge use SYNTH_MODEL; questions + queries use default", kinds("synthesis").length > 0 && kinds("synthesis").every(m => m === SYNTH_MODEL) &&
@@ -270,6 +284,17 @@ try {
   check("claim not answering its question dropped", rm.result.droppedLowRelevance === 1 && outcome("multi B [low]") === "low_relevance");
   check("claim answering its question kept", outcome("multi C [medium]") === "kept");
   check("multi run keeps exactly A1, A2, C", JSON.stringify(rm.findings.map(f => f.claim)) === JSON.stringify(["multi A1", "multi A2", "multi C [medium]"]), rm.findings.map(f => f.claim));
+
+  // Judge cases: question 0, out-of-range, hardware different/related
+  synthMode = "judgeCases";
+  const rj = await runResearch(db, idea, deps());
+  synthMode = "default";
+  const jo = (c: string) => rj.checked.find(f => f.claim === c)?.outcome;
+  check("judge question 0 dropped", jo("jc none [q0]") === "low_relevance");
+  check("judge question out of range -> unchecked", jo("jc out of range [q9]") === "unchecked" && rj.result.droppedUnchecked === 1);
+  check("hardware 'different' dropped", jo("jc different board [diff]") === "hardware_different" && rj.result.droppedHardwareDifferent === 1);
+  check("hardware 'related' kept and recorded", jo("jc related board [rel]") === "kept" && rj.result.keptHardwareRelated === 1 &&
+    rj.result.findingsDetail.find(f => f.claim === "jc related board [rel]")?.hardware === "related", rj.result.findingsDetail.map(f => f.outcome));
 
   // Claim dedupe across runs: different quote, same normalized claim
   synthMode = "claimVariant";

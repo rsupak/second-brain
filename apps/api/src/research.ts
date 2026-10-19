@@ -288,12 +288,15 @@ const SupportSchema = z.object({
   results: z.array(z.object({
     index: z.number().int(),
     supported: z.enum(["yes", "partial", "no"]),
-    answers: z.enum(["yes", "no"])
+    question: z.number().int(),
+    hardware: z.enum(["same", "related", "different"])
   }))
 });
 
 export type SupportLevel = "yes" | "partial" | "no";
-export type Rating = { supported: SupportLevel; answers: "yes" | "no" } | "unchecked";
+export type Hardware = "same" | "related" | "different";
+/** question: 1-based index into the question list chosen by the judge, 0 = answers none. */
+export type Rating = { supported: SupportLevel; question: number; hardware: Hardware } | "unchecked";
 
 /** Case/whitespace/punctuation-insensitive form used for claim and quote dedupe. */
 export function normalizeForDedupe(s: string): string {
@@ -301,38 +304,47 @@ export function normalizeForDedupe(s: string): string {
 }
 
 /**
- * One batched LLM call rating each claim against its quote (support) and against its question
- * ("does this claim help answer question N?"). Without a question, the idea itself is the question.
- * Invalid output is retried once; if still invalid, every finding is "unchecked" (dropped by the caller).
- * A finding the model does not rate is also "unchecked".
+ * One batched judge call (SYNTH_MODEL). Per finding:
+ * - supported: claim vs quote only;
+ * - question: which question (1..N) the claim best answers, 0 if none (judge sees the full list);
+ * - hardware: same / related (same chip family or LoRa radio) / different, relative to the idea.
+ * Invalid output is retried once; if still invalid, every finding is "unchecked".
+ * A finding the judge skips, or whose question is out of range, is "unchecked".
  */
 export async function checkSupport(
-  idea: Idea, findings: Array<{ claim: string; quote: string; question?: string | null }>, deps: ResearchDeps
+  idea: Idea, findings: Array<{ claim: string; quote: string }>, questions: string[], deps: ResearchDeps
 ): Promise<{ ratings: Rating[]; attempts: number; error: string | null; raw?: string }> {
   if (findings.length === 0) return { ratings: [], attempts: 0, error: null };
+  const qs = questions.length ? questions : [`Is ${idea.title} feasible as described?`];
   const items = findings.map((f, i) => ({ index: i + 1, ...f }));
   let error: string | null = null;
   let lastRaw = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const raw = await deps.llm([
-        { role: "system", content: `For each item, make two INDEPENDENT judgments.
-1. "supported" compares only CLAIM with QUOTE. Ignore the question for this judgment.
+        { role: "system", content: `For each item, make three INDEPENDENT judgments.
+1. "supported" compares only CLAIM with QUOTE.
 - "yes": the quote states what the claim says; nothing in the claim goes beyond the quote.
 - "partial": the quote supports only part of the claim, or the claim adds details not in the quote.
 - "no": the quote does not say what the claim says.
-2. "answers" compares only CLAIM with QUESTION. Ignore whether the quote is good for this judgment.
-- "yes": the claim gives concrete information toward answering the question.
-- "no": the claim is generic, promotional, off-topic, or about different hardware than the question asks about.
-A claim can be supported but not answer the question, or answer the question but be unsupported.
-Return ONLY JSON: {"results": [{"index": N, "supported": "yes"|"partial"|"no", "answers": "yes"|"no"}]} with one entry per item.` },
-        { role: "user", content: `IDEA: ${idea.title}\n${idea.content}\n\n` + items.map(it =>
-          `ITEM ${it.index}\nQUESTION: ${it.question ?? `Is ${idea.title} feasible as described?`}\nCLAIM: ${it.claim}\nQUOTE: ${it.quote}`).join("\n\n") }
-      ], { format: "json", temperature: 0, numPredict: 600, numCtx: 4096, model: SYNTH_MODEL });
+2. "question": the number of the QUESTION (from the list) that the claim best helps answer with concrete information, or 0 if it answers none.
+3. "hardware" compares the hardware the claim is about with the IDEA's hardware.
+- "same": the same board as the idea, or the claim is not about a specific board.
+- "related": a different board that uses the same chip family (for example ESP32-S3) or the same LoRa radio family (for example SX1262 / SX126x).
+- "different": a board with a different chip family and a different radio.
+Return ONLY JSON: {"results": [{"index": N, "supported": "yes"|"partial"|"no", "question": Q, "hardware": "same"|"related"|"different"}]} with one entry per item.` },
+        { role: "user", content: `IDEA: ${idea.title}\n${idea.content}\n\nQUESTIONS:\n${qs.map((q, i) => `${i + 1}. ${q}`).join("\n")}\n\n` +
+          items.map(it => `ITEM ${it.index}\nCLAIM: ${it.claim}\nQUOTE: ${it.quote}`).join("\n\n") }
+      ], { format: "json", temperature: 0, numPredict: 800, numCtx: 8192, model: SYNTH_MODEL });
       lastRaw = raw;
       const parsed = SupportSchema.parse(extractJsonObject(raw));
-      const byIndex = new Map(parsed.results.map(r => [r.index, { supported: r.supported, answers: r.answers }]));
-      return { ratings: items.map(it => byIndex.get(it.index) ?? "unchecked"), attempts: attempt, error: null, raw: lastRaw };
+      const byIndex = new Map(parsed.results.map(r => [r.index, r]));
+      const ratings: Rating[] = items.map(it => {
+        const r = byIndex.get(it.index);
+        if (!r || r.question < 0 || r.question > qs.length) return "unchecked";
+        return { supported: r.supported, question: r.question, hardware: r.hardware };
+      });
+      return { ratings, attempts: attempt, error: null, raw: lastRaw };
     } catch (e) {
       error = String(e).slice(0, 300);
       deps.log?.(`support check attempt ${attempt} invalid: ${error.slice(0, 160)}`);
@@ -363,6 +375,7 @@ Rules:
 - Use each quote at most once. Never attach the same quote to two claims.
 - Prefer findings from different excerpts and sources; at most 2 findings per source.
 - "claim" is a short, specific factual statement that the quote directly supports. Do not add facts that are not in the quote.
+- If the quote is about a specific board or module, the claim must name that exact board (for example "The Heltec Wireless Stick V3 ..."), not the idea's board.
 - "chunk" is the number of the excerpt containing the quote.
 - Use only the excerpts. If an excerpt has nothing useful, skip it. If nothing is useful, return {"findings": []}.
 - At most 8 findings. No markdown, no commentary.`;
@@ -499,9 +512,9 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
     unique.push(f);
   }
 
-  // 6b. Support + "answers its question" check (one call); keep supported=yes AND answers=yes
-  const qText = (f: VerifiedFinding) => f.question ? questions[f.question - 1]! : null;
-  const support = await checkSupport(idea, unique.map(f => ({ claim: f.claim, quote: f.quote, question: qText(f) })), deps);
+  // 6b. Judge: support (claim vs quote), which question it answers (judge-chosen), hardware relation.
+  // Keep supported=yes AND question>0 AND hardware!=different.
+  const support = await checkSupport(idea, unique.map(f => ({ claim: f.claim, quote: f.quote })), questions, deps);
   const chunkOf = new Map(top.map(c => [c.id, c]));
   const perSite = new Map<string, number>();
   const checked: SupportedFinding[] = unique.map((f, i) => {
@@ -511,7 +524,8 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
     if (rating === "unchecked") outcome = "unchecked";
     else if (rating.supported === "no") outcome = "unsupported";
     else if (rating.supported === "partial") outcome = "partial";
-    else if (rating.answers !== "yes") outcome = "low_relevance";
+    else if (rating.question === 0) outcome = "low_relevance";
+    else if (rating.hardware === "different") outcome = "hardware_different";
     else {
       // 6c. Per-site cap on kept findings, in model order
       const n = perSite.get(c.site) ?? 0;
@@ -541,6 +555,8 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
       quotesVerified: kept.length, findingsDropped: dropped.length,
       droppedReusedQuote, droppedUnsupported: count("unsupported"), droppedPartial: count("partial"),
       droppedUnchecked: count("unchecked"), droppedLowRelevance: count("low_relevance"), droppedSourceCap: count("source_cap"),
+      droppedHardwareDifferent: count("hardware_different"),
+      keptHardwareRelated: accepted.filter(f => f.rating !== "unchecked" && f.rating.hardware === "related").length,
       supportAttempts: support.attempts, supportError: support.error,
       findingsKept: accepted.length, synthesisError,
       synthModel: SYNTH_MODEL, rankingMode,
@@ -551,11 +567,16 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
         synthesisRaw: synthDiag?.raw.slice(0, 4000) ?? null,
         supportRaw: support.raw?.slice(0, 2000) ?? null
       } } : {}),
-      findingsDetail: checked.map(f => ({
-        claim: f.claim, url: f.url, site: f.site, type: f.type, question: f.question, questionText: qText(f),
-        support: f.rating === "unchecked" ? "unchecked" : f.rating.supported,
-        answers: f.rating === "unchecked" ? "unchecked" : f.rating.answers, outcome: f.outcome
-      })),
+      findingsDetail: checked.map(f => {
+        const r = f.rating === "unchecked" ? null : f.rating;
+        const jq = r && r.question > 0 ? r.question : null;
+        return {
+          claim: f.claim, url: f.url, site: f.site, type: f.type,
+          judgeQuestion: r ? r.question : null, judgeQuestionText: jq && questions.length ? questions[jq - 1] : null,
+          excerptQuestion: f.question, support: r ? r.supported : "unchecked", hardware: r ? r.hardware : "unchecked",
+          outcome: f.outcome
+        };
+      }),
       timings
     }
   };
