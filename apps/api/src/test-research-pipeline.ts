@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { ensureResearchTables } from "./research-schema.js";
 import { sha256, verifyQuote, type FetchResult } from "./research-sources.js";
-import { runResearch, pickCandidates, selectTopChunks, type ResearchDeps, type ChatMessage } from "./research.js";
+import { runResearch, pickCandidates, selectTopChunks, siteKey, sourceType, parseQuestions, type ResearchDeps, type ChatMessage } from "./research.js";
 import { createResearchJobStore, ActiveResearchJobError, LeaseLostError, type ResearchJob } from "./research-jobs.js";
 
 const dbPath = process.env.BRAIN_DB;
@@ -28,11 +28,11 @@ function check(label: string, ok: boolean, detail?: unknown) {
 
 // ---------- fakes ----------
 const PAGES: Record<string, string> = {
-  "https://a.example/lora": "LoRa radios use chirp spread spectrum modulation. A LoRa sensor node can run for years on a battery when it transmits rarely. Range depends on spreading factor and terrain.",
-  "https://b.example/battery": "Battery life of a sensor depends mostly on sleep current. Deep sleep on the ESP32-S3 draws microamps. Transmitting dominates the energy budget.",
-  "https://c.example/other": "Gardening tips for tomatoes. Water in the morning. Use mulch."
+  "https://lora.example/lora": "LoRa radios use chirp spread spectrum modulation. A LoRa sensor node can run for years on a battery when it transmits rarely. Range depends on spreading factor and terrain.",
+  "https://battery.example/battery": "Battery life of a sensor depends mostly on sleep current. Deep sleep on the ESP32-S3 draws microamps. Transmitting dominates the energy budget.",
+  "https://garden.example/other": "Gardening tips for tomatoes. Water in the morning. Use mulch."
 };
-let llmMode: "good" | "garbage" = "good";
+let llmMode: "good" | "garbage" | "badQueries" = "good";
 let supportMode: "yes" | "partial" | "no" | "bad" | "bad-once" = "yes";
 let supportCalls = 0;
 let synthMode: "default" | "multi" | "claimVariant" = "default";
@@ -48,11 +48,11 @@ function fakeFetch(url: string): Promise<FetchResult> {
 }
 
 const fakeSearch = (q: string) => Promise.resolve([
-  { url: "https://a.example/lora#section", title: "A" },
+  { url: "https://lora.example/lora#section", title: "A" },
   { url: "ftp://files.example/x", title: "ftp" },
   { url: "https://missing.example/404", title: "404" },
-  { url: q.length % 2 ? "https://b.example/battery" : "https://c.example/other", title: "B/C" },
-  { url: "https://a.example/lora", title: "A dup" }
+  { url: q.length % 2 ? "https://battery.example/battery" : "https://garden.example/other", title: "B/C" },
+  { url: "https://lora.example/lora", title: "A dup" }
 ]);
 
 const KEYS = ["lora", "battery", "sensor", "sleep", "tomato"];
@@ -60,18 +60,22 @@ const fakeEmbed = (texts: string[]) => Promise.resolve(texts.map(t => KEYS.map(k
 
 function fakeLlm(messages: ChatMessage[]): Promise<string> {
   const sys = messages[0]!.content;
-  if (sys.includes("search queries")) {
-    return Promise.resolve(llmMode === "garbage" ? "sure! here are queries: lora, battery"
+  if (sys.includes("open questions")) {
+    return Promise.resolve(llmMode === "garbage" ? "I cannot help with that."
+      : JSON.stringify({ questions: ["How long can a LoRa sensor run on battery?", "What deep sleep current does the ESP32-S3 draw?", "What range does LoRa reach?"] }));
+  }
+  if (sys.includes("write web search queries")) {
+    return Promise.resolve(llmMode === "badQueries" ? "not json"
       : JSON.stringify({ queries: ["LoRa sensor battery life", "ESP32-S3 deep sleep current", "LoRa range"] }));
   }
-  if (sys.includes("rate whether each quote supports")) {
+  if (sys.includes('"answers": does this claim help answer')) {
     supportCalls++;
     const claimsIn = [...messages[1]!.content.matchAll(/^CLAIM: (.*)$/gm)].map(m => m[1]!);
     const n = claimsIn.length;
-    const rel = (c: string) => c.includes("[low]") ? "low" : c.includes("[medium]") ? "medium" : "high";
+    const ans = (c: string) => c.includes("[low]") ? "no" : "yes";
     if (supportMode === "bad" || (supportMode === "bad-once" && supportCalls === 1)) return Promise.resolve("I think they are fine");
     const level = supportMode === "bad-once" ? "yes" : supportMode;
-    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level, relevance: rel(claimsIn[i]!) })) }));
+    return Promise.resolve(JSON.stringify({ results: Array.from({ length: n }, (_, i) => ({ index: i + 1, supported: level, answers: ans(claimsIn[i]!) })) }));
   }
   // Synthesis: quote the first sentence of excerpt 1 verbatim, plus a fabricated quote and a bad chunk number.
   const user = messages[1]!.content;
@@ -86,16 +90,16 @@ function fakeLlm(messages: ChatMessage[]): Promise<string> {
   if (synthMode === "multi") {
     const [e1, e2, e3] = excerpts;
     return Promise.resolve(JSON.stringify({ findings: [
-      { claim: "multi A1", quote: e1!.sentences[0], chunk: e1!.n },
-      { claim: "multi A2", quote: e1!.sentences[1], chunk: e1!.n },
-      { claim: "multi A3", quote: e1!.sentences[2], chunk: e1!.n },
-      { claim: "multi reused", quote: e1!.sentences[0], chunk: e1!.n },
-      { claim: "multi B [low]", quote: e2!.sentences[0], chunk: e2!.n },
-      { claim: "multi C [medium]", quote: e3!.sentences[0], chunk: e3!.n }
+      { claim: "multi A1", quote: e1!.sentences[0], chunk: e1!.n, question: 1 },
+      { claim: "multi A2", quote: e1!.sentences[1], chunk: e1!.n, question: 1 },
+      { claim: "multi A3", quote: e1!.sentences[2], chunk: e1!.n, question: 1 },
+      { claim: "multi reused", quote: e1!.sentences[0], chunk: e1!.n, question: 1 },
+      { claim: "multi B [low]", quote: e2!.sentences[0], chunk: e2!.n, question: 2 },
+      { claim: "multi C [medium]", quote: e3!.sentences[0], chunk: e3!.n, question: "Q3" }
     ] }));
   }
   return Promise.resolve(JSON.stringify({ findings: [
-    { claim: "Supported claim", quote: firstSentence, chunk: 1 },
+    { claim: "Supported claim", quote: firstSentence, chunk: 1, question: 1 },
     { claim: "Fabricated claim", quote: "LoRa reaches 500 km in every city.", chunk: 1 },
     { claim: "Bad index", quote: firstSentence, chunk: 99 }
   ] }));
@@ -125,8 +129,29 @@ try {
   const picked = pickCandidates([[{ url: "https://x/1#a", title: "" }, { url: "mailto:a@b", title: "" }], [{ url: "https://x/1", title: "" }, { url: "https://y/2", title: "" }]], 5);
   check("candidates: dedupe (fragment stripped), non-http skipped, round-robin", JSON.stringify(picked.map(p => p.url)) === JSON.stringify(["https://x/1", "https://y/2"]), picked.map(p => p.url));
 
+  // Site keys
+  const keys = ["https://openelab.com/a", "https://openelab.io/b", "https://news.bbc.co.uk/x", "https://www.example.com.au/y",
+    "https://pmc.ncbi.nlm.nih.gov/articles/1", "https://wiki.heltec.org/docs", "https://heltec.org/p"].map(siteKey);
+  check("site key: openelab.com/.io grouped, multi-part TLDs, subdomains", JSON.stringify(keys) ===
+    JSON.stringify(["openelab", "openelab", "bbc", "example", "nih", "heltec", "heltec"]), keys);
+  const types = ["https://pmc.ncbi.nlm.nih.gov/articles/1", "https://arxiv.org/abs/1", "https://cs.mit.edu/p", "https://docs.espressif.com/x",
+    "https://lib.readthedocs.io/en", "https://github.com/meshtastic/firmware", "https://en.wikipedia.org/wiki/LoRa",
+    "https://www.reddit.com/r/x", "https://electronics.stackexchange.com/q/1", "https://openelab.com/blogs/learn/x", "https://vendor.com/files/ds.pdf"].map(sourceType);
+  check("source types by domain/path", JSON.stringify(types) === JSON.stringify(["paper", "paper", "paper", "docs", "docs", "docs", "reference", "forum", "forum", "blog", "docs"]), types);
+  const cands = pickCandidates([
+    [{ url: "https://openelab.com/1", title: "" }, { url: "https://openelab.io/2", title: "" }, { url: "https://openelab.net/3", title: "" }, { url: "https://arxiv.org/abs/9", title: "" }],
+    [{ url: "https://www.reddit.com/r/x", title: "" }, { url: "https://en.wikipedia.org/wiki/LoRa", title: "" }],
+    [{ url: "https://openelab.com/4", title: "" }]
+  ], 10, 2);
+  check("candidates: site cap (max 2 openelab)", cands.filter(c => c.site === "openelab").length === 2, cands.map(c => c.url));
+  check("candidates: type order paper > reference > forum > blog", JSON.stringify(cands.map(c => c.type)) === JSON.stringify(["paper", "reference", "forum", "blog", "blog"]), cands.map(c => c.type));
+  check("candidates: every query contributes", new Set(cands.map(c => c.query)).size === 3, cands.map(c => c.query));
+  check("pdf URLs skipped as candidates", pickCandidates([[{ url: "https://arxiv.org/pdf/2512.07408", title: "" }, { url: "https://x.org/a.pdf", title: "" }, { url: "https://arxiv.org/abs/1", title: "" }]], 10).map(c => c.url).join() === "https://arxiv.org/abs/1");
+  check("parseQuestions: numbered/bulleted lines, dedupe", JSON.stringify(parseQuestions("Here:\n1. What range is achievable?\n2) **How much power is used?**\n- What range is achievable?\nnoise")) ===
+    JSON.stringify(["What range is achievable?", "How much power is used?"]));
+
   // Per-source cap unit
-  const mk = (src: string, score: number) => ({ id: `${src}-${score}`, source_id: src, text: "", url: "", score });
+  const mk = (src: string, score: number) => ({ id: `${src}-${score}`, source_id: `${src}-id`, site: src, type: "blog" as const, text: "", url: "", score });
   const sel = selectTopChunks([mk("s1", 0.99), mk("s1", 0.98), mk("s1", 0.97), mk("s1", 0.96), mk("s2", 0.5), mk("s2", 0.4), mk("s2", 0.3), mk("s3", 0.1), mk("s4", 0.05)], 6, 2);
   const per = sel.reduce<Record<string, number>>((m, c) => (m[c.source_id] = (m[c.source_id] ?? 0) + 1, m), {});
   check("per-source cap: max 2 per source, filled by rank to 6", sel.length === 6 && Object.values(per).every(n => n <= 2) &&
@@ -143,7 +168,9 @@ try {
   // Run 1
   const j1 = claimFor(job1);
   const r1 = await runResearch(db, idea, deps({ stillOwned: () => store.owns(j1) }));
-  check("queries from LLM used", r1.result.queries.length === 3 && !r1.result.queryFallback, r1.result.queries);
+  check("questions generated then one query per question", r1.result.questions.length === 3 && r1.result.queries.length === 3 && !r1.result.queryFallback && r1.result.queryFallbackKind === "none", r1.result.questions);
+  check("finding mapped to question text", r1.result.findingsDetail[0]?.question === 1 && r1.result.findingsDetail[0]?.questionText === r1.result.questions[0], r1.result.findingsDetail[0]);
+  check("result JSON has source type/site and distinct sites", r1.result.distinctSites === 3 && r1.result.sourcesDetail.every(d => d.type === "blog" && d.site.length > 0), r1.result.sourcesDetail.map(d => d.site));
   check("fetched sources (dedupe, ftp skipped, 404 recorded)", r1.result.fetched === 3 && r1.result.fetchFailed === 1 && !fetchCalls.some(u => u.startsWith("ftp")), { fetched: r1.result.fetched, fetchFailed: r1.result.fetchFailed, calls: fetchCalls });
   check("404 source stored with error", (db.prepare(`SELECT error FROM research_sources WHERE idea_id = ? AND url = 'https://missing.example/404'`).get(ideaId) as any)?.error === "HTTP 404");
   check("chunks embedded", r1.result.chunksEmbedded === r1.result.chunksTotal && r1.result.chunksTotal > 0, { embedded: r1.result.chunksEmbedded, total: r1.result.chunksTotal });
@@ -169,6 +196,9 @@ try {
   llmMode = "garbage";
   const r3 = await runResearch(db, idea, deps());
   check("bad query JSON falls back to idea title", r3.result.queryFallback && JSON.stringify(r3.result.queries) === JSON.stringify([idea.title]), r3.result.queries);
+  llmMode = "badQueries";
+  const r3b = await runResearch(db, idea, deps());
+  check("bad query JSON with good questions: questions used as queries", r3b.result.queryFallbackKind === "questions_as_queries" && JSON.stringify(r3b.result.queries) === JSON.stringify(r3b.result.questions), r3b.result.queries);
   llmMode = "good";
 
   // Claim-support check cases (no DB writes: runResearch only stores sources/chunks)
@@ -193,8 +223,8 @@ try {
   const outcome = (c: string) => rm.checked.find(f => f.claim === c)?.outcome;
   check("reused quote dropped (first use kept)", rm.result.droppedReusedQuote === 1 && outcome("multi A1") === "kept" && !rm.checked.some(f => f.claim === "multi reused"), rm.result.droppedReusedQuote);
   check("per-source kept cap (max 2 per source)", rm.result.droppedSourceCap === 1 && outcome("multi A3") === "source_cap" && outcome("multi A2") === "kept");
-  check("low relevance dropped", rm.result.droppedLowRelevance === 1 && outcome("multi B [low]") === "low_relevance");
-  check("medium relevance kept", outcome("multi C [medium]") === "kept");
+  check("claim not answering its question dropped", rm.result.droppedLowRelevance === 1 && outcome("multi B [low]") === "low_relevance");
+  check("claim answering its question kept (question \"Q3\" coerced to 3)", outcome("multi C [medium]") === "kept" && rm.checked.find(f => f.claim === "multi C [medium]")?.question === 3);
   check("multi run keeps exactly A1, A2, C", JSON.stringify(rm.findings.map(f => f.claim)) === JSON.stringify(["multi A1", "multi A2", "multi C [medium]"]), rm.findings.map(f => f.claim));
 
   // Claim dedupe across runs: different quote, same normalized claim
