@@ -61,7 +61,7 @@ async function evaluate(job: EvaluationJob) {
   const raw = await generateResponse([
     {
       role: "system",
-      content: `You evaluate proposed engineering ideas.
+      content: `You evaluate proposed ideas of any kind (software, hardware, research, business, personal, or other).
 
 Return ONLY one valid JSON object.
 
@@ -82,7 +82,7 @@ The JSON object must contain exactly these fields:
 SCORING CRITERIA:
 
 Feasibility:
-1 = Extremely difficult to implement with available hardware
+1 = Extremely difficult to implement with the resources the idea implies
 2 = Significant engineering challenges
 3 = Moderate engineering effort
 4 = Achievable with some additional development
@@ -91,16 +91,16 @@ Feasibility:
 Cost:
 1 = Minimal additional expense
 2 = Low additional expense
-3 = Moderate hardware or service expense
+3 = Moderate expense (equipment, services, or time)
 4 = Substantial additional expense
 5 = Significant expense or infrastructure investment
 
 Relevance:
-1 = Weak connection to the user's projects
+1 = Weak usefulness for the stated goal
 2 = Limited relevance
 3 = Somewhat relevant
 4 = Strong relevance
-5 = Directly supports the LoRa lab or Second Brain
+5 = Directly useful for the goal the idea describes
 
 Novelty:
 1 = Common or widely implemented solution
@@ -111,14 +111,14 @@ Novelty:
 
 IMPORTANT RULES:
 - Evaluate each scoring dimension independently.
-- Assign scores based on the actual idea and available hardware.
+- Assign scores based on the actual idea as described.
 - Do not use default scores.
 - Do not automatically assign a score of 1.
 - Scores of 1 are valid when justified by the criteria.
 - Higher cost scores indicate greater expense.
-- Do not invent hardware capabilities, research findings, or performance statistics.
+- Do not invent capabilities, research findings, or performance statistics.
 - Treat unsupported performance claims as unverified.
-- Include specific engineering requirements and realistic limitations.
+- Include specific requirements and realistic limitations.
 - Return valid JSON only.
 - Do not include markdown, code fences, explanations outside JSON, or additional fields.
 
@@ -128,29 +128,25 @@ Cost: 5 = most expensive.
 Relevance: 5 = strongest fit.
 Novelty: 5 = most distinctive.
 
-Available hardware:
-- Apple M2 Mac mini, 16 GB memory
-- Two Heltec ESP32-S3 LoRa boards
-- Arduino Uno Q
-
 The user is comfortable with software development.
 
-Identify missing hardware and engineering dependencies.
+Do not assume any particular hardware, platform, or domain unless the idea names it.
+Identify missing dependencies (tools, data, skills, equipment, services).
 Treat performance statistics and research claims as unverified.
 Do not invent studies, test results, or sources.
 Do not claim that internet research was performed.
-Do not assume the Arduino Uno Q has a LoRa radio.
-Do not assume the LoRa network supports mesh routing.
 Keep the evaluation concise.`
     },
     {
       role: "user",
-      content: JSON.stringify({
+      content: `Evaluate this idea and return the evaluation JSON object (feasibility, cost, relevance, novelty, summary, requirements, limitations, claims). Do not repeat the input.
+
+Idea: ${JSON.stringify({
         title: idea.title,
         description: idea.content,
         depth: idea.depth,
         automatically_flagged_claims: flaggedClaims
-      })
+      })}`
     }
   ], {
     format: "json",
