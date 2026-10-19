@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { generateResponse } from "./ai.js";
+import { parseBranches } from "./expansion-parse.js";
 import type { Idea } from "./ideas.js";
 import {
   MAX_ATTEMPTS,
@@ -16,53 +17,6 @@ const POLL_MS = 5000;
 
 const store = createExpansionJobStore(db);
 
-function parseBranches(raw: string): Branch[] {
-  const cleaned = raw
-    .replace(/```(?:json)?/gi, "")
-    .replace(/```/g, "")
-    .trim();
-
-  const start = cleaned.indexOf("[");
-  const end = cleaned.lastIndexOf("]");
-
-  if (start < 0 || end < start) {
-    throw new Error("Model did not return a JSON array");
-  }
-
-  const parsed: unknown = JSON.parse(
-    cleaned.slice(start, end + 1)
-  );
-
-  if (!Array.isArray(parsed) || parsed.length !== 3) {
-    throw new Error("Expected exactly three branches");
-  }
-
-  return parsed.map((item: unknown) => {
-    if (
-      !item ||
-      typeof item !== "object" ||
-      !("title" in item) ||
-      !("explanation" in item) ||
-      typeof item.title !== "string" ||
-      typeof item.explanation !== "string"
-    ) {
-      throw new Error("Invalid branch structure");
-    }
-
-    const title = item.title.trim();
-    const explanation = item.explanation.trim();
-
-    if (!title || !explanation) {
-      throw new Error("Empty branch content");
-    }
-
-    return {
-      title: title.slice(0, 200),
-      explanation: explanation.slice(0, 3000)
-    };
-  });
-}
-
 async function expand(idea: Idea): Promise<Branch[]> {
   const level = idea.depth === 0
     ? "secondary"
@@ -74,8 +28,8 @@ async function expand(idea: Idea): Promise<Branch[]> {
       content: `You are an idea development agent.
 Develop exactly three distinct, practical ${level} ideas.
 Consider feasibility, constraints, benefits, and novelty.
-Return ONLY a valid JSON array of exactly three objects:
-[{"title":"...","explanation":"..."}, ...]
+Return ONLY a JSON object with an "ideas" array of exactly three objects:
+{"ideas":[{"title":"...","explanation":"..."}, ...]}
 No markdown, no additional commentary.`
     },
     {
@@ -86,7 +40,7 @@ Details: ${idea.content}
 
 Develop three useful ${level} ideas.`
     }
-  ]);
+  ], { format: "json" });
 
   return parseBranches(raw);
 }
