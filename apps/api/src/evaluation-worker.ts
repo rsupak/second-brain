@@ -35,6 +35,17 @@ function extractJson(raw: string): unknown {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
+// The model occasionally misspells a score key (seen: "novelity"); map known variants. Never overrides a correct key.
+const KEY_ALIASES: Record<string, string> = { novelity: "novelty", feasability: "feasibility", relevence: "relevance", relavance: "relevance" };
+function normalizeKeys(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  for (const [bad, good] of Object.entries(KEY_ALIASES)) {
+    if (bad in out && !(good in out)) { out[good] = out[bad]; delete out[bad]; }
+  }
+  return out;
+}
+
 function detectClaims(content: string): string[] {
   const matches = [
     ...content.matchAll(
@@ -63,83 +74,69 @@ async function evaluate(job: EvaluationJob) {
       role: "system",
       content: `You evaluate proposed ideas of any kind (software, hardware, research, business, personal, or other).
 
-Return ONLY one valid JSON object.
+Return ONLY one valid JSON object with these fields, in this order:
 
-The JSON object must contain exactly these fields:
-
-- "feasibility": integer from 1 to 5
-- "cost": integer from 1 to 5
-- "relevance": integer from 1 to 5
-- "novelty": integer from 1 to 5
+- "reasoning": object with one short sentence per dimension, written BEFORE choosing scores:
+    {"feasibility": "...", "cost": "...", "relevance": "...", "novelty": "..."}
+  Each sentence names the main reason and the biggest risk for that dimension.
+- "feasibility": integer 1-5
+- "cost": integer 1-5
+- "relevance": integer 1-5
+- "novelty": integer 1-5
 - "summary": non-empty string explaining the evaluation
 - "requirements": array of strings describing implementation requirements
-- "limitations": array of strings describing technical limitations
-- "claims": array of objects containing:
-    - "claim": string describing a factual claim requiring verification
-    - "status": either "unverified" or "needs_external_evidence"
-    - "reason": string explaining why verification is necessary
+- "limitations": array of strings describing limitations
+- "claims": array of objects {"claim": string, "status": "unverified" | "needs_external_evidence", "reason": string}
 
-SCORING CRITERIA:
+SCORE ANCHORS (pick the anchor that best matches; use the whole range):
 
-Feasibility:
-1 = Extremely difficult to implement with the resources the idea implies
-2 = Significant engineering challenges
-3 = Moderate engineering effort
-4 = Achievable with some additional development
-5 = Straightforward to prototype with available resources
+Feasibility (5 = easiest):
+1 = Requires breakthroughs, unavailable resources, or a large team for years
+2 = Major unsolved parts; months of specialist work with uncertain outcome
+3 = Clear path but substantial work: several weeks, multiple components or integrations
+4 = A few days to two weeks for one developer using known tools
+5 = A few hours to a weekend with existing tools or libraries
 
-Cost:
-1 = Minimal additional expense
-2 = Low additional expense
-3 = Moderate expense (equipment, services, or time)
-4 = Substantial additional expense
-5 = Significant expense or infrastructure investment
+Cost (5 = MOST EXPENSIVE; a higher cost score means MORE money/resources needed):
+1 = Essentially free: existing equipment, free software, no ongoing fees
+2 = Under about $50 or small free-tier usage
+3 = About $50-$500, or modest recurring fees
+4 = About $500-$5,000, or significant recurring service costs
+5 = Over $5,000, specialised equipment, staff, or infrastructure
 
-Relevance:
-1 = Weak usefulness for the stated goal
-2 = Limited relevance
-3 = Somewhat relevant
-4 = Strong relevance
-5 = Directly useful for the goal the idea describes
+Relevance (5 = strongest fit):
+1 = Solves no clear problem for anyone identifiable
+2 = Nice-to-have; problem is rare or minor
+3 = Useful for a real but narrow need
+4 = Solves a frequent, clearly felt problem for its intended users
+5 = Directly addresses a pressing, high-value need stated in the idea
 
-Novelty:
-1 = Common or widely implemented solution
-2 = Minor variation of an existing solution
-3 = Some distinctive features
-4 = Innovative combination of existing technologies
-5 = Highly original or unusual application
+Novelty (5 = most distinctive):
+1 = Many existing products/solutions already do exactly this
+2 = Small variation on a common solution
+3 = Familiar parts combined in a somewhat distinctive way
+4 = Uncommon approach; few known examples
+5 = No known equivalent; genuinely new approach
 
-IMPORTANT RULES:
-- Evaluate each scoring dimension independently.
-- Assign scores based on the actual idea as described.
-- Do not use default scores.
-- Do not automatically assign a score of 1.
-- Scores of 1 are valid when justified by the criteria.
-- Higher cost scores indicate greater expense.
-- Do not invent capabilities, research findings, or performance statistics.
-- Treat unsupported performance claims as unverified.
-- Include specific requirements and realistic limitations.
-- Return valid JSON only.
-- Do not include markdown, code fences, explanations outside JSON, or additional fields.
+CALIBRATION EXAMPLES (scores only; not related to the idea you evaluate):
+- "Script that renames my photo files by date taken": feasibility 5, cost 1, relevance 3, novelty 1
+- "Mobile app for a local sports league to schedule games and track standings": feasibility 3, cost 3, relevance 4, novelty 2
+- "Desktop fusion reactor for home electricity": feasibility 1, cost 5, relevance 4, novelty 5
 
-All scores are integers from 1 to 5.
-Feasibility: 5 = easiest.
-Cost: 5 = most expensive.
-Relevance: 5 = strongest fit.
-Novelty: 5 = most distinctive.
-
-The user is comfortable with software development.
-
-Do not assume any particular hardware, platform, or domain unless the idea names it.
-Identify missing dependencies (tools, data, skills, equipment, services).
-Treat performance statistics and research claims as unverified.
-Do not invent studies, test results, or sources.
-Do not claim that internet research was performed.
-Keep the evaluation concise.`
+RULES:
+- Score each dimension independently from its own anchors; the scores do not need to be similar to each other.
+- Do not default to the same scores for every idea. Do not avoid 1 or 5 when the anchor fits.
+- Base scores on the idea as described. Do not assume any particular hardware, platform, or domain unless the idea names it.
+- The user is comfortable with software development.
+- Identify missing dependencies (tools, data, skills, equipment, services).
+- Do not invent capabilities, studies, test results, sources, or performance statistics; treat such claims as unverified.
+- Do not claim that internet research was performed.
+- Return valid JSON only: no markdown, code fences, or text outside the JSON object.
+- Keep the evaluation concise.`
     },
     {
       role: "user",
-      content: `Evaluate this idea and return the evaluation JSON object (feasibility, cost, relevance, novelty, summary, requirements, limitations, claims). Do not repeat the input.
+      content: `Evaluate this idea and return the evaluation JSON object (reasoning, feasibility, cost, relevance, novelty, summary, requirements, limitations, claims). Do not repeat the input.
 
 Idea: ${JSON.stringify({
         title: idea.title,
@@ -151,7 +148,9 @@ Idea: ${JSON.stringify({
   ], {
     format: "json",
     temperature: 0,
-    numPredict: 1200
+    numPredict: 1600,
+    // Prompt with anchors + examples exceeds the 2048 default context.
+    numCtx: 4096
   });
 
   console.log("\n--- RAW MODEL RESPONSE ---");
@@ -159,7 +158,7 @@ Idea: ${JSON.stringify({
   console.log("--- END MODEL RESPONSE ---\n");
 
   const evaluation = EvaluationSchema.parse(
-    extractJson(raw)
+    normalizeKeys(extractJson(raw))
   );
 
   // Deterministically preserve claims detected by code,
