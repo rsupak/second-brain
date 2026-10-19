@@ -1,0 +1,84 @@
+interface OllamaMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+interface GenerateOptions {
+  format?: "json";
+  temperature?: number;
+  numPredict?: number;
+  timeoutMs?: number;
+}
+
+export async function generateResponse(
+  messages: OllamaMessage[],
+  options: GenerateOptions = {}
+): Promise<string> {
+  const response = await fetch(
+    "http://127.0.0.1:11434/api/chat",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "qwen3:4b",
+        messages,
+        stream: false,
+        think: false,
+        ...(options.format
+          ? { format: options.format }
+          : {}),
+        options: {
+          temperature: options.temperature ?? 0.2,
+          num_ctx: 2048,
+          num_predict: options.numPredict ?? 700
+        }
+      }),
+      signal: AbortSignal.timeout(
+        options.timeoutMs ?? 300000
+      )
+    }
+  );
+
+  if (!response.ok) {
+    const details = await response.text();
+
+    throw new Error(
+      `Ollama request failed (${response.status}): ${details}`
+    );
+  }
+
+  const data = await response.json() as {
+    message?: {
+      content?: string;
+    };
+    done_reason?: string;
+  };
+
+  const content = (data.message?.content ?? "")
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/^[\s\S]*?<\/think>/, "")
+    .trim();
+
+  if (!content) {
+    throw new Error(
+      `Ollama returned empty content. Completion reason: ${
+        data.done_reason ?? "unknown"
+      }`
+    );
+  }
+
+  if (
+    options.format === "json" &&
+    data.done_reason !== "stop"
+  ) {
+    throw new Error(
+      `Ollama did not finish JSON generation. Reason: ${
+        data.done_reason ?? "unknown"
+      }. Output preview: ${content.slice(0, 250)}`
+    );
+  }
+
+  return content;
+}
