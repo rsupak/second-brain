@@ -20,11 +20,13 @@ import {
 } from "./ideas.js";
 import {
   queueEvaluations,
-  listEvaluations
+  listEvaluations,
+  queueEvaluationForIdea
 } from "./evaluations.js";
 import Database from "better-sqlite3";
 import { researchRoutes } from "./research-routes.js";
 import { addCrossSiteGuard } from "./security.js";
+import { createResearchJobStore } from "./research-jobs.js";
 
 const app = Fastify({ logger: process.env.SECOND_BRAIN_NO_LISTEN !== "1" });
 
@@ -156,7 +158,19 @@ app.post("/ideas", async (request, reply) => {
     parsed.data.content
   );
 
-  return reply.code(201).send(result);
+  // Auto-queue evaluation and research for user-created ideas only (worker child ideas don't pass through here).
+  // Additive response fields; failures are logged and never fail the idea creation.
+  const extra: { evaluationJobId?: string | null; researchJobId?: string | null } = {};
+  if (process.env.AUTO_EVALUATE !== "0") {
+    try { extra.evaluationJobId = queueEvaluationForIdea(result.idea.id); }
+    catch (error) { request.log.error(error, "Auto-evaluate queue failed"); extra.evaluationJobId = null; }
+  }
+  if (process.env.AUTO_RESEARCH !== "0") {
+    try { extra.researchJobId = createResearchJobStore(researchDb).enqueue(result.idea.id); }
+    catch (error) { request.log.error(error, "Auto-research queue failed"); extra.researchJobId = null; }
+  }
+
+  return reply.code(201).send({ ...result, ...extra });
 });
 
 app.get("/ideas", async () => listIdeas());

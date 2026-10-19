@@ -97,3 +97,14 @@ export function listEvaluations() {
       DESC
   `).all();
 }
+
+/** Queue an evaluation job for one idea (idempotent: one job per idea). Returns the job id, or null if already queued/evaluated. */
+export function queueEvaluationForIdea(ideaId: string): string | null {
+  if (db.prepare(`SELECT 1 FROM idea_evaluations WHERE idea_id = ?`).get(ideaId)) return null;
+  const id = randomUUID();
+  const r = db.prepare(`
+    INSERT INTO evaluation_jobs (id, idea_id) VALUES (?, ?)
+    ON CONFLICT(idea_id) DO NOTHING
+  `).run(id, ideaId);
+  return r.changes === 1 ? id : null;
+}
