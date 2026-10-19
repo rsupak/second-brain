@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { embed, cosineSimilarity } from "./embeddings.js";
 import type { Memory } from "./database.js";
 
-const db = new Database("./data/brain.sqlite");
+const db = new Database(process.env.BRAIN_DB ?? "./data/brain.sqlite");
 db.pragma("journal_mode = WAL");
 
 db.exec(`

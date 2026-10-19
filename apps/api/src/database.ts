@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 
 mkdirSync("./data", { recursive: true });
 
-const db = new Database("./data/brain.sqlite");
+const db = new Database(process.env.BRAIN_DB ?? "./data/brain.sqlite");
 
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");

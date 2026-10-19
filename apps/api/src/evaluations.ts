@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
-const db = new Database("./data/brain.sqlite");
+const db = new Database(process.env.BRAIN_DB ?? "./data/brain.sqlite");
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 

@@ -24,8 +24,12 @@ import {
 } from "./evaluations.js";
 import Database from "better-sqlite3";
 import { researchRoutes } from "./research-routes.js";
+import { addCrossSiteGuard } from "./security.js";
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: process.env.SECOND_BRAIN_NO_LISTEN !== "1" });
+
+// Refuse cross-site state-changing requests (see security.ts). Applies to every route.
+addCrossSiteGuard(app);
 
 app.get("/health", async () => ({
   status: "ok",
@@ -188,7 +192,7 @@ app.get("/evaluations", async () => {
 
 app.get("/evaluations/status", async () => {
   const Database = (await import("better-sqlite3")).default;
-  const db = new Database("./data/brain.sqlite");
+  const db = new Database(process.env.BRAIN_DB ?? "./data/brain.sqlite");
 
   try {
     return db.prepare(`
@@ -220,4 +224,7 @@ async function start() {
   }
 }
 
-start();
+export { app };
+
+// Tests import the app with SECOND_BRAIN_NO_LISTEN=1 and use app.inject().
+if (process.env.SECOND_BRAIN_NO_LISTEN !== "1") start();
