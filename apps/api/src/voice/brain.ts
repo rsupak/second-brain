@@ -29,6 +29,12 @@ export async function captureIdea(content: string): Promise<{ id: string; title:
   return { id: String(body?.idea?.id ?? ""), title };
 }
 
+export async function createSkill(ideaId: string): Promise<{ status: number; body: any }> {
+  const api = process.env.VOICE_API_URL ?? "http://127.0.0.1:3333";
+  const res = await fetch(`${api}/ideas/${encodeURIComponent(ideaId)}/skill`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
 const SYSTEM = "You are Bailey, Richard's local voice assistant. Answer in one to three short spoken sentences. " +
   "Plain text only: no markdown, lists, emoji or code. If you don't know, say so briefly. " +
   "You cannot save, capture or remember anything yourself; never claim you did.";

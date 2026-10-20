@@ -7,7 +7,9 @@ import { networkInterfaces } from "node:os";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 import { Whisper, Piper, createOpusDecoder, encodeOpusFrames, rms, FRAME_MS, SAMPLE_RATE } from "./engines.js";
-import { parseCapture, captureIdea, answer, splitSentences } from "./brain.js";
+import { captureIdea, answer, splitSentences, createSkill, VOICE_MODEL } from "./brain.js";
+import { createExplorer } from "./explore.js";
+import Database from "better-sqlite3";
 import { filterTranscript, audioGate } from "./filters.js";
 import { openSync, writeSync, closeSync, readFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -127,6 +129,17 @@ http.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, ws => session(ws, deviceId!, String(req.headers["client-id"] ?? "")));
 });
 
+const brainDb = new Database(process.env.BRAIN_DB ?? "./data/brain.sqlite");
+brainDb.pragma("journal_mode = WAL"); brainDb.pragma("busy_timeout = 5000"); brainDb.pragma("foreign_keys = ON");
+const explorer = createExplorer({
+  db: brainDb, model: VOICE_MODEL, log,
+  embed: async xs => (await import("../ai.js")).embedTexts(xs),
+  llm: async (m, o) => (await import("../ai.js")).generateResponse(m, { model: VOICE_MODEL, think: false, temperature: o?.temperature ?? 0.3, numPredict: o?.numPredict ?? 150, numCtx: 4096, timeoutMs: 60_000 }),
+  captureIdea, createSkill, generalAnswer: answer
+});
+// Idle sessions (>10 min, CONVERSATION_IDLE_MS) are closed and summarized even if the device stays quiet.
+const sweep = setInterval(() => { try { explorer.sweepIdle(); } catch (e) { log("idle sweep failed", e); } }, 60_000); sweep.unref();
+
 function session(ws: WebSocket, deviceId: string, clientId: string) {
   const sessionId = randomUUID();
   const decoder = createOpusDecoder();
@@ -190,14 +203,11 @@ function session(ws: WebSocket, deviceId: string, clientId: string) {
       if (!text) { log(`ignored transcript (${reason}):`, JSON.stringify(rawText)); idle(); return; }
       send({ type: "stt", text });
       const t1 = Date.now();
-      let reply: string; let emotion = "neutral";
-      const idea = parseCapture(text);
-      if (idea) {
-        try { const r = await captureIdea(idea); reply = `Got it. I saved your idea: ${r.title}.`; emotion = "happy"; log("idea created", r.id); }
-        catch (e) { log("capture failed", e); reply = "Sorry, I couldn't save that idea."; emotion = "sad"; }
-      } else {
-        reply = await answer(text);
-      }
+      // Exploration brain: idea capture, open/confirm/recap, grounded answers, notes, skill, evaluation, close; else a general answer.
+      const out = await explorer.handle(deviceId, text);
+      const reply = out.reply; const emotion = out.emotion;
+      if (out.intent === "capture") log("capture", reply);
+      log("brain", JSON.stringify({ intent: out.intent, session: out.sessionId ?? null, idea: out.ideaId ?? null, timings: out.timings }));
       t.llm = Date.now() - t1;
       send({ type: "llm", emotion, text: emotion === "happy" ? "😊" : emotion === "sad" ? "😔" : "🙂" });
       t.tts = await speak(reply);
