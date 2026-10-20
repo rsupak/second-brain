@@ -109,7 +109,7 @@ const llmFake = (messages: ChatMessage[]): Promise<string> => {
     const titles = [...user.matchAll(/^(\d+)\. (.*)$/gm)];
     return Promise.resolve(JSON.stringify({ results: titles.map(m => ({ index: Number(m[1]), relevant: /detector|GLAST/i.test(m[2]!) ? "no" : "yes" })) }));
   }
-  if (sys.includes("draw 0 to 2 small diagrams")) { prompts.diagram = user;
+  if (sys.includes("draw 0 to 2 small")) { prompts.diagram = user;
     return Promise.resolve(JSON.stringify({ diagrams: [
       { title: "How a starter works", type: "flowchart", direction: "LR", nodes: [{ id: "s", label: "Starter [F1]" }, { id: "y", label: "Yeast activity [F2]" }, { id: "t", label: "Temperature" }],
         edges: [{ from: "t", to: "y", label: "raises [F2]" }, { from: "s", to: "y" }, { from: "s", to: "ghost" }] },
@@ -199,6 +199,17 @@ const scr = await screenTitles(relIdea, [P("https://arxiv.org/abs/glast"), { ...
 check("screenTitles drops off-field scholarly titles via the judge; non-papers are not screened", scr.kept.map(c => c.url).join() === "https://arxiv.org/abs/ok,https://blog.example/x" && scr.dropped.length === 1, scr);
 const scrFail = await screenTitles(relIdea, [P("https://arxiv.org/abs/a")], { llm: () => Promise.resolve("nope") });
 check("screenTitles keeps candidates when the judge fails", scrFail.kept.length === 1 && scrFail.dropped.length === 0);
+
+{
+  const { normalizeDiagramsJson } = await import("./diagrams.js");
+  const n = normalizeDiagramsJson({ diagram_type: "flowchart", nodes: [{ id: "a", label: "x" }] }, "T") as any;
+  check("normalizeDiagramsJson wraps a bare diagram and maps diagram_type/title", n.diagrams.length === 1 && n.diagrams[0].type === "flowchart" && n.diagrams[0].title === "T");
+  const { parseEdgeList } = await import("./diagrams.js");
+  const pe = parseEdgeList("DIAGRAM: Miss recovery\nStreak missed -> Check history [F2]\nCheck history [F2] -> Smaller action [F5] : adapt\njunk line", "T") as any[];
+  const pm = specToMermaid(pe[0], 6) as any;
+  check("parseEdgeList: text edge list -> flowchart spec -> valid Mermaid (shared boxes reused)", pe.length === 1 && pe[0].nodes.length === 3 && pe[0].edges.length === 2 && pm.diagram && validateMermaid(pm.diagram.mermaid).ok, pm);
+  check("sanitizeLabel splits [F7, F8] into [F7] [F8]", sanitizeLabel("Tracks rate [F7, F8]") === "Tracks rate [F7] [F8]", sanitizeLabel("Tracks rate [F7, F8]"));
+}
 
 // ---------- store + mocked deep dive ----------
 const store = createSkillStore(db);
