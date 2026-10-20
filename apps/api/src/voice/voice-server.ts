@@ -46,7 +46,7 @@ function acquireLock(): void {
       let alive = false; try { if (pid > 0) { process.kill(pid, 0); alive = true; } } catch (k: any) { alive = k.code === "EPERM"; }
       if (alive) {
         console.error(`[voice] another voice service is already running (pid ${pid}, lock ${LOCK_FILE}). Not starting a second instance.`);
-        process.exit(3);
+        process.exit(Number(process.env.VOICE_LOCKED_EXIT_CODE ?? 3)); // launchd sets 0 so KeepAlive{SuccessfulExit:false} won't loop
       }
       try { unlinkSync(LOCK_FILE); } catch {}
     }
