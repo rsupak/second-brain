@@ -1,5 +1,6 @@
+import { stripReasoning, capReply } from "./filters.js";
 // Routes a transcript to the Second Brain: idea capture via POST /ideas, otherwise a short answer.
-const CAPTURE_RE = /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:bailey[\s,.!]+)?(?:please[\s,]+)?(?:new idea|(?:capture|save|add|record) (?:an |a |a new |new )?idea)\b[\s:,.\-–—]*/i;
+const CAPTURE_RE = /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:(?:bailey|baily|bailie|bailee|bayley|baylee|bailey's)[\s,.!]+)?(?:please[\s,]+)?(?:new idea|(?:capture|save|add|record) (?:an |a |a new |new )?idea)\b[\s:,.\-–—]*/i;
 
 export function parseCapture(text: string): string | null {
   const m = CAPTURE_RE.exec(text);
@@ -29,20 +30,26 @@ export async function captureIdea(content: string): Promise<{ id: string; title:
 }
 
 const SYSTEM = "You are Bailey, Richard's local voice assistant. Answer in one to three short spoken sentences. " +
-  "Plain text only: no markdown, lists, emoji or code. If you don't know, say so briefly.";
+  "Plain text only: no markdown, lists, emoji or code. If you don't know, say so briefly. " +
+  "You cannot save, capture or remember anything yourself; never claim you did.";
+
+// qwen3:4b on this Mac is the thinking-only 2507 build: think:false and /no_think are ignored and it
+// reasons in plain text. Voice answers therefore default to gemma4 (non-thinking, ~1 s), override with VOICE_MODEL.
+export const VOICE_MODEL = process.env.VOICE_MODEL ?? "gemma4:e4b-it-qat";
+const FALLBACK = "Sorry, I don't have a short answer for that.";
 
 export async function answer(question: string): Promise<string> {
   const { generateResponse } = await import("../ai.js"); // lazy: opens the inference lock only when needed
   const raw = await generateResponse(
-    [{ role: "system", content: SYSTEM }, { role: "user", content: question + " /no_think" }],
-    { temperature: 0.4, numPredict: 200, timeoutMs: 120_000 }
+    [{ role: "system", content: SYSTEM }, { role: "user", content: question }],
+    { model: VOICE_MODEL, think: false, temperature: 0.4, numPredict: 150, timeoutMs: 60_000 }
   );
   return cleanForSpeech(raw);
 }
 
 export function cleanForSpeech(s: string): string {
-  return s.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "")
-    .replace(/[*_#`>]+/g, "").replace(/\s+/g, " ").trim() || "Sorry, I don't have an answer for that.";
+  const stripped = stripReasoning(s);
+  return stripped ? capReply(stripped) || FALLBACK : FALLBACK;
 }
 
 export function splitSentences(s: string): string[] {

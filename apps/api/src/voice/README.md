@@ -11,8 +11,15 @@ Protocol source: github.com/78/xiaozhi-esp32 at commit `aab98abdb3866f16662d448e
 1. Device Opus frames (16 kHz, mono, 60 ms) are decoded with `opusscript`.
 2. Audio is buffered until `listen stop`. In `auto`/`realtime` mode, an energy VAD ends the utterance after 800 ms of silence.
 3. Speech-to-text runs on `whisper-server` (small.en-q5_1), kept warm on 127.0.0.1:8178 as a child process.
-4. If the transcript starts with "new idea" or "capture/save/add an idea", it's sent as `POST /ideas` to `VOICE_API_URL` with no Origin header. Anything else gets a short answer from `generateResponse` (qwen3:4b, through the inference lock).
+4. If the transcript starts with "new idea" or "capture/save/add an idea", it's sent as `POST /ideas` to `VOICE_API_URL` with no Origin header. Anything else gets a short answer from `generateResponse` through the inference lock, with `VOICE_MODEL` (default `gemma4:e4b-it-qat`, because the local qwen3:4b is the thinking-only build and ignores `think:false`). Replies have reasoning stripped and are capped at 3 sentences / 300 chars (num_predict 150).
 5. The reply is spoken with a warm Piper worker (`piper_worker.py`) at 16 kHz and sent as 60 ms Opus frames, wrapped in `tts start`, `sentence_start` and `stop`.
+
+## Noise, abort, limits
+- Before STT: utterances under 300 ms or with under 240 ms of voiced audio (RMS > `VOICE_MIN_RMS`, default 400) are dropped.
+- After STT: empty, bracketed/parenthesised annotations (`[Distant talking]`, `(music)`, `[BLANK_AUDIO]`), too-short text and known Whisper hallucinations ("Thank you.", "you") are dropped. Ignored audio is logged, nothing is spoken, and the device gets `tts stop` so it returns to idle.
+- TTS is capped at `VOICE_MAX_TTS_MS` (default 20000). A device `abort` stops frames immediately.
+- Single instance: `logs/voice.pid` lock (`VOICE_LOCK_FILE`). A second start exits with code 3 and "another voice service is already running". Stale locks from dead pids are taken over.
+- Children (whisper-server, Piper) are stopped and awaited on SIGINT/SIGTERM/SIGHUP; a detached watchdog stops them if the parent is SIGKILLed.
 
 ## Env vars
 | var | default | |

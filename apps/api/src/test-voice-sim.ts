@@ -3,7 +3,7 @@
 // Requires a running voice service (npm run voice). Env: VOICE_SIM_URL (http://IP:8000), VOICE_TOKEN,
 // VOICE_SIM_DEVICE (an allowlisted MAC).
 import "dotenv/config";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
@@ -33,8 +33,8 @@ function connect(headers: Record<string, string>): Promise<{ ws?: WebSocket; sta
   });
 }
 
-async function utterance(ws: WebSocket, text: string, timeoutMs = 240_000) {
-  const pcm = speechPcm(text);
+async function utterance(ws: WebSocket, text: string | Buffer, timeoutMs = 240_000) {
+  const pcm = typeof text === "string" ? speechPcm(text) : text;
   const frames = encodeOpusFrames(Buffer.concat([pcm, Buffer.alloc(16000 * 2 * 0.3)]));
   const msgs: any[] = []; const audio: Buffer[] = [];
   const dec = createOpusDecoder();
@@ -104,10 +104,75 @@ async function main() {
     const level = rms(r.out);
     check(`[${label}] Opus reply decodes to audible PCM`, r.out.length > 16000 * 2 * 0.5 && level > 300, `${(r.out.length / 32000).toFixed(2)}s rms=${level.toFixed(0)}`);
     if (isIdea) check(`[idea] reply confirms saved idea`, sentences.join(" ").includes("saved your idea"), sentences.join(" | "));
-    else check(`[question] reply mentions 212`, sentences.join(" ").includes("212"), sentences.join(" | "));
+    else {
+      check(`[question] reply mentions 212`, sentences.join(" ").includes("212"), sentences.join(" | "));
+      const said = sentences.join(" ");
+      check(`[question] reply capped (<=3 sentences, <=300 chars, no reasoning)`, sentences.length <= 3 && said.length <= 300 && !/the user|i need to|<\/?think>/i.test(said), `${sentences.length} sentences, ${said.length} chars`);
+    }
     console.log(`LATENCY [${label}] speech=${r.speechMs}ms stt=${r.sttMs}ms brain=${r.brainMs}ms first_audio=${r.firstAudioMs}ms total(after stop -> tts stop)=${r.totalMs}ms`);
   }
+
+  // ---------- noise: must be ignored without speaking ----------
+  const quiet = Buffer.alloc(16000 * 2 * 1.5); for (let i = 0; i < quiet.length / 2; i++) quiet.writeInt16LE(Math.round((Math.random() - 0.5) * 200), i * 2);
+  for (const [label, input] of [["low-energy noise", quiet], ["whisper hallucination 'Thank you.'", "Thank you."]] as const) {
+    const r = await utterance(ws, input, 30_000);
+    const types = r.msgs.map(m => `${m.type}${m.state ? ":" + m.state : ""}`);
+    check(`[noise] ${label} ignored: no stt/llm, no audio, tts stop -> idle`, !r.msgs.some(m => m.type === "stt" || m.type === "llm") && r.out.length === 0 && types.at(-1) === "tts:stop", `${types.join(",")} audio=${r.out.length}B stopAfter=${r.totalMs}ms`);
+  }
+
+  // ---------- abort: frames stop immediately ----------
+  {
+    const pcm = speechPcm("Tell me a story about a dragon who learns to bake bread.");
+    const frames = encodeOpusFrames(Buffer.concat([pcm, Buffer.alloc(16000 * 2 * 0.3)]));
+    let abortAt = 0, framesBefore = 0, lateFrames = 0, stopAt = 0;
+    const done = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("abort timeout")), 120_000);
+      ws.on("message", function onMsg(data, bin) {
+        if (bin) {
+          if (!abortAt) { framesBefore++; if (framesBefore === 3) { abortAt = Date.now(); ws.send(JSON.stringify({ type: "abort", reason: "wake_word_detected" })); } }
+          else if (Date.now() - abortAt > 150) lateFrames++;
+          return;
+        }
+        const m = JSON.parse(data.toString());
+        if (m.type === "tts" && m.state === "stop") { stopAt = Date.now(); clearTimeout(timer); ws.off("message", onMsg); resolve(); }
+      });
+    });
+    ws.send(JSON.stringify({ type: "listen", state: "start", mode: "manual" }));
+    for (const f of frames) { ws.send(f); await new Promise(r => setTimeout(r, FRAME_MS)); }
+    ws.send(JSON.stringify({ type: "listen", state: "stop" }));
+    await done;
+    check("[abort] no audio frames >150 ms after abort, tts stop follows", abortAt > 0 && lateFrames === 0 && stopAt - abortAt < 2000, `late=${lateFrames} stop ${stopAt - abortAt}ms after abort`);
+  }
+
+  // ---------- TTS duration cap (admin announce of a very long text) ----------
+  {
+    const capMs = Number(process.env.VOICE_SIM_MAX_TTS_MS ?? 20000);
+    const dec = createOpusDecoder(); const audio: Buffer[] = [];
+    const done = new Promise<void>(resolve => ws.on("message", function onMsg(data, bin) {
+      if (bin) { audio.push(dec.decode(data as Buffer)); return; }
+      const m = JSON.parse(data.toString()); if (m.type === "tts" && m.state === "stop") { ws.off("message", onMsg); resolve(); }
+    }));
+    const longText = Array.from({ length: 12 }, (_, i) => `This is test sentence number ${i + 1}, which is here only to make the announcement much longer than the cap.`).join(" ").slice(0, 500);
+    const res = await fetch(BASE.replace(/:\d+$/, ":" + (process.env.VOICE_ADMIN_PORT ?? "8001")).replace(/\/\/[^:/]+/, "//127.0.0.1") + "/admin/say",
+      { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ text: longText }) });
+    await done; dec.delete();
+    const secs = Buffer.concat(audio).length / 32000;
+    check(`[tts cap] long announce cut at <= ${capMs / 1000}s`, res.status === 200 && secs <= capMs / 1000 + 0.2 && secs > capMs / 1000 - 1.5, `status=${res.status} audio=${secs.toFixed(2)}s`);
+  }
   ws.close();
+
+  // ---------- single instance: a second service must refuse to start ----------
+  {
+    const t0 = Date.now();
+    const r = await new Promise<{ code: number | null; err: string }>(resolve => {
+      const c = spawn("npx", ["tsx", "apps/api/src/voice/voice-server.ts"], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      let err = ""; c.stderr.on("data", d => err += d); c.stdout.on("data", d => err += d);
+      const kill = setTimeout(() => c.kill("SIGKILL"), 30_000);
+      c.on("exit", code => { clearTimeout(kill); resolve({ code, err }); });
+    });
+    const health = await fetch(BASE + "/health").then(x => x.status, () => -1);
+    check("[single instance] second instance exits with clear message, first still healthy", r.code === 3 && /already running/.test(r.err) && health === 200, `exit=${r.code} in ${Date.now() - t0}ms health=${health} msg="${r.err.trim().split("\n")[0]}"`);
+  }
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 }

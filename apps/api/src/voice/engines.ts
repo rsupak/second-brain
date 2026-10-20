@@ -2,6 +2,7 @@
 // Piper worker (TTS) and Opus encode/decode (opusscript, pure JS/WASM, works on arm64).
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import { connect } from "node:net";
 import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,6 +58,27 @@ export function rms(pcm: Buffer): number {
   return n ? Math.sqrt(s / n) : 0;
 }
 
+/** Spawn a child plus a detached watchdog that stops it if this process dies (even by SIGKILL).
+ *  SIGINT first, SIGKILL only after 30 s: an early SIGKILL during Metal teardown can leave whisper-server stuck in exit (UE). */
+function spawnTied(cmd: string, args: string[], opts: Parameters<typeof spawn>[2]): ChildProcess {
+  const child = spawn(cmd, args, opts);
+  if (child.pid) {
+    const dog = spawn("/bin/sh", ["-c",
+      'while kill -0 "$1" 2>/dev/null && kill -0 "$2" 2>/dev/null; do sleep 2; done; kill -INT "$2" 2>/dev/null; n=0; while kill -0 "$2" 2>/dev/null && [ $n -lt 30 ]; do sleep 1; n=$((n+1)); done; kill -9 "$2" 2>/dev/null; exit 0',
+      "voice-watchdog", String(process.pid), String(child.pid)], { detached: true, stdio: "ignore" });
+    dog.unref();
+  }
+  return child;
+}
+
+// whisper-server gets SIGINT: on macOS a SIGTERM'd whisper-server can hang in kernel exit (state UE) after Metal use.
+function killChild(p?: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+  if (!p || p.exitCode !== null || p.signalCode !== null) return Promise.resolve();
+  const exited = new Promise<void>(res => p.once("exit", () => res()));
+  if (!(p as any).__stopSent) { (p as any).__stopSent = true; try { p.kill(signal); } catch {} }
+  return exited;
+}
+
 // ---------- whisper-server (kept warm on 127.0.0.1) ----------
 export class Whisper {
   private proc?: ChildProcess;
@@ -66,12 +88,19 @@ export class Whisper {
   }
   async start() {
     if (!process.env.WHISPER_SERVER_URL) {
+      const u = new URL(this.url);
+      const busy = await new Promise<boolean>(res => {
+        const sock = connect(Number(u.port), u.hostname); sock.setTimeout(1000);
+        sock.once("connect", () => { sock.destroy(); res(true); });
+        sock.once("error", () => res(false)); sock.once("timeout", () => { sock.destroy(); res(false); });
+      });
+      if (busy) throw new Error(`${this.url} is already in use (orphaned whisper-server?). Stop it first: pkill -f "whisper-server.*--port ${new URL(this.url).port}"`);
       const model = process.env.WHISPER_MODEL ?? join(VOICE_TOOLS, "models/ggml-small.en-q5_1.bin");
       const port = new URL(this.url).port;
-      this.proc = spawn(process.env.WHISPER_SERVER_BIN ?? "whisper-server",
+      this.proc = spawnTied(process.env.WHISPER_SERVER_BIN ?? "whisper-server",
         ["-m", model, "--host", "127.0.0.1", "--port", port, "-t", "4", "-l", "en"],
-        { stdio: ["ignore", "ignore", "pipe"] });
-      this.proc.stderr?.on("data", () => {}); // drain
+        // stderr ignored, not piped: a pipe whose reader (this process) is gone left whisper-server hung in exit (UE).
+        { stdio: ["ignore", "ignore", "ignore"] });
       this.proc.on("exit", code => console.error(`[voice] whisper-server exited (${code})`));
     }
     for (let i = 0; i < 120; i++) {
@@ -89,9 +118,10 @@ export class Whisper {
     const res = await fetch(this.url + "/inference", { method: "POST", body: form });
     if (!res.ok) throw new Error(`whisper-server HTTP ${res.status}`);
     const json = await res.json() as { text?: string };
-    return (json.text ?? "").replace(/\[BLANK_AUDIO\]/g, "").replace(/\s+/g, " ").trim();
+    return (json.text ?? "").replace(/\s+/g, " ").trim(); // raw; filterTranscript() decides what is noise
   }
-  stop() { this.proc?.kill("SIGTERM"); }
+  /** Resolves once whisper-server has exited. Exiting the parent before that left it hung in exit (UE) on macOS. */
+  stop(): Promise<void> { return killChild(this.proc, "SIGINT"); }
 }
 
 // ---------- Piper (persistent python worker) ----------
@@ -104,7 +134,7 @@ export class Piper {
     const py = process.env.PIPER_PYTHON ?? join(VOICE_TOOLS, ".venv/bin/python");
     const voice = process.env.PIPER_VOICE ?? join(VOICE_TOOLS, "voices/en_US-lessac-medium.onnx");
     const script = new URL("./piper_worker.py", import.meta.url).pathname;
-    this.proc = spawn(py, [script, voice], { stdio: ["pipe", "pipe", "pipe"] });
+    this.proc = spawnTied(py, [script, voice], { stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr?.on("data", () => {});
     this.proc.on("exit", code => console.error(`[voice] piper worker exited (${code})`));
     const ready = new Promise<void>((resolve, reject) => {
@@ -136,5 +166,5 @@ export class Piper {
     this.chain = p.catch(() => {});
     return p;
   }
-  stop() { this.proc?.kill("SIGTERM"); }
+  stop(): Promise<void> { return killChild(this.proc); }
 }

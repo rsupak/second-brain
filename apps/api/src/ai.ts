@@ -51,6 +51,8 @@ interface GenerateOptions {
   numCtx?: number;
   /** Optional model override; defaults to qwen3:4b (unchanged behavior). */
   model?: string;
+  /** Optional Ollama think flag; defaults to false (unchanged behavior). */
+  think?: boolean;
 }
 
 export async function generateResponse(
@@ -79,7 +81,7 @@ async function callOllama(
         model: options.model ?? "qwen3:4b",
         messages,
         stream: false,
-        think: false,
+        think: options.think ?? false,
         ...(options.format
           ? { format: options.format }
           : {}),
