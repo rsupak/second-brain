@@ -29,6 +29,8 @@ export type ResearchDeps = {
   filterCandidates?: (idea: Idea, candidates: Candidate[]) => Promise<{ kept: Candidate[]; dropped: Array<{ url: string; title: string; reason: string }> }>;
   /** Return false to skip a candidate before fetching (e.g. source-type mix caps). */
   admitSource?: (c: Candidate, ctx: { usedTypes: SourceType[]; remaining: Candidate[] }) => boolean;
+  /** Return false to treat a fetched source as unusable (e.g. JS shells, bot-check pages). It is still saved. */
+  usableSource?: (res: FetchResult) => boolean;
 };
 
 export const LIMITS = {
@@ -75,7 +77,7 @@ export function siteKey(u: string): string {
   return labels[labels.length - 2]!;
 }
 
-const PAPER_HOSTS = ["pmc.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "arxiv.org", "doi.org", "ieeexplore.ieee.org", "ieee.org",
+const PAPER_HOSTS = ["europepmc.org", "oadoi.org", "pubmed.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "arxiv.org", "doi.org", "ieeexplore.ieee.org", "ieee.org",
   "mdpi.com", "sciencedirect.com", "springer.com", "link.springer.com", "dl.acm.org", "acm.org", "researchgate.net",
   "semanticscholar.org", "nature.com", "frontiersin.org", "hindawi.com", "wiley.com", "tandfonline.com", "iopscience.iop.org"];
 const FORUM_HOSTS = ["reddit.com", "stackexchange.com", "stackoverflow.com", "news.ycombinator.com", "quora.com"];
@@ -463,7 +465,7 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
       log(`source in use, keeping existing chunks: ${c.url}`);
     }
     // Usable if it has chunks (fresh, unchanged, kept after a failed refetch, or in use).
-    if (id && db.prepare(`SELECT 1 FROM research_chunks WHERE source_id = ? LIMIT 1`).get(id)) {
+    if (id && (!deps.usableSource || deps.usableSource(res)) && db.prepare(`SELECT 1 FROM research_chunks WHERE source_id = ? LIMIT 1`).get(id)) {
       fetched++; sourceIds.push(id); sourceUrl.set(id, res.final_url ?? res.url);
       sourceMeta.set(id, { site: c.site, type: c.type });
       sourcesDetail.push({ url: c.url, site: c.site, type: c.type, query: c.query + 1, used: true, error: res.error });
@@ -599,11 +601,12 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
 
 // ---------- default (live) deps ----------
 
-export function searxngSearch(baseUrl = process.env.SEARXNG_URL ?? "http://127.0.0.1:8888") {
+export function searxngSearch(baseUrl = process.env.SEARXNG_URL ?? "http://127.0.0.1:8888", opts: { categories?: string } = {}) {
   return async (query: string): Promise<SearchHit[]> => {
     const u = new URL("/search", baseUrl);
     u.searchParams.set("q", query);
     u.searchParams.set("format", "json");
+    if (opts.categories) u.searchParams.set("categories", opts.categories);
     const res = await fetch(u, { signal: AbortSignal.timeout(20000) });
     if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
     const data = await res.json() as { results?: Array<{ url?: string; title?: string }> };

@@ -9,7 +9,10 @@ import { sha256, verifyQuote, type FetchResult } from "./research-sources.js";
 import { LIMITS, type ChatMessage, type ResearchDeps } from "./research.js";
 import { ensureSkillTables, skillState } from "./skills-schema.js";
 import { createSkillStore, ActiveDeepDiveError, SkillExistsError, LeaseLostError } from "./skill-jobs.js";
-import { checkCitations, buildSections, withDeepLimits, runDeepDive, DEEP_LIMITS, practicalQueries, titleGate, paperCap, relevanceGate, dedupeList, writeupPrompt, QUALITY } from "./deep-dive.js";
+import { checkCitations, buildSections, withDeepLimits, runDeepDive, DEEP_LIMITS, practicalQueries, titleGate, paperCap, relevanceGate, dedupeList, writeupPrompt, QUALITY,
+  scholarlyQueries, balancedMix, completeQuote, filterUncited, usableDeepSource, screenTitles } from "./deep-dive.js";
+import { sanitizeLabel, validateMermaid, specToMermaid, generateDiagrams } from "./diagrams.js";
+import { pickTitle } from "./research-sources.js";
 import { skillsRoutes, clusterTopics } from "./skills-routes.js";
 import { addCrossSiteGuard } from "./security.js";
 
@@ -63,6 +66,7 @@ check("clusterTopics groups similar skills, labels by common tag", topics.get("a
 const PAGES: Record<string, string> = {
   "https://bake.example/starter": "A sourdough starter is a culture of wild yeast and bacteria. Starter activity rises with temperature. Feeding the starter flour and water keeps it alive.",
   "https://bake.example/temp": "Sourdough yeast is most active near 26 degrees Celsius. Cold temperature slows the starter. Whole grain flour feeds yeast faster.",
+  "https://arxiv.org/abs/sourdough": "We studied sourdough starter yeast at several temperature levels. Warmer temperature increased starter yeast activity in our flour samples.",
   "https://wiki.example/sourdough": "Sourdough bread uses a starter instead of commercial yeast. The flour type changes sourdough flavor."
 };
 const fetchFake = (url: string): Promise<FetchResult> => { fetchedUrls.push(url);
@@ -73,6 +77,9 @@ const searchQueries: string[] = [];
 const searchFake = (q: string) => { searchQueries.push(q); return Promise.resolve([...Object.keys(PAGES).map(url => ({ url, title: `sourdough starter yeast ${url}` })),
   { url: "https://physics.example/streaks", title: "Low-speed streaks in a turbulent boundary layer" }]); };
 const fetchedUrls: string[] = [];
+const scienceQueries: string[] = [];
+const scienceFake = (q: string) => { scienceQueries.push(q); return Promise.resolve([{ url: "https://arxiv.org/abs/sourdough", title: "A study of sourdough starter yeast" },
+  { url: "https://arxiv.org/abs/glast", title: "GLAST sourdough starter yeast detector" }]); };
 const KEYS = ["sourdough", "starter", "yeast", "temperature", "flour"];
 // Last dimension marks text with none of the keywords, so off-domain text is near-orthogonal to on-domain text.
 const embedFake = (texts: string[]) => Promise.resolve(texts.map(t => { const v = KEYS.map(k => (t.toLowerCase().split(k).length - 1) + 0.01); return [...v, v.every(x => x < 1) ? 1 : 0.01]; }));
@@ -98,6 +105,17 @@ const llmFake = (messages: ChatMessage[]): Promise<string> => {
     findings.push({ claim: "Sourdough starter yeast cures every disease", quote: "Sourdough starter yeast cures every disease.", chunk: 1 });   // not verbatim -> dropped
     return Promise.resolve(JSON.stringify({ findings }));
   }
+  if (sys.includes("screen search results")) { prompts.screen = user;
+    const titles = [...user.matchAll(/^(\d+)\. (.*)$/gm)];
+    return Promise.resolve(JSON.stringify({ results: titles.map(m => ({ index: Number(m[1]), relevant: /detector|GLAST/i.test(m[2]!) ? "no" : "yes" })) }));
+  }
+  if (sys.includes("draw 0 to 2 small diagrams")) { prompts.diagram = user;
+    return Promise.resolve(JSON.stringify({ diagrams: [
+      { title: "How a starter works", type: "flowchart", direction: "LR", nodes: [{ id: "s", label: "Starter [F1]" }, { id: "y", label: "Yeast activity [F2]" }, { id: "t", label: "Temperature" }],
+        edges: [{ from: "t", to: "y", label: "raises [F2]" }, { from: "s", to: "y" }, { from: "s", to: "ghost" }] },
+      { title: "Evil", type: "flowchart", nodes: [{ id: "a", label: "x" }], edges: [] },
+      { title: "Feeding", type: "sequence", participants: [{ id: "b", label: "Baker" }, { id: "s", label: "Starter" }], messages: [{ from: "b", to: "s", text: "feeds flour and water [F1] [F99]" }] }] }));
+  }
   if (sys.includes("study guide")) { prompts.writeup = user;
     if (writeupMode === "bad") return Promise.resolve("not json at all");
     return Promise.resolve(JSON.stringify({ summary: "How sourdough starters work.", _dup: 0, overview: "A starter is a yeast culture [F1]. It is famous on Mars [F42].",
@@ -105,7 +123,8 @@ const llmFake = (messages: ChatMessage[]): Promise<string> => {
   }
   return Promise.reject(new Error(`unexpected prompt: ${sys.slice(0, 60)}`));
 };
-const deps: ResearchDeps = { search: searchFake, fetch: fetchFake, embed: embedFake, llm: llmFake as ResearchDeps["llm"] };
+// Fake pages are short; usableDeepSource's 600-char floor is unit-tested above, so the mocked run only requires text.
+const deps = { usableSource: (r: FetchResult) => !!r.text, search: searchFake, searchScience: scienceFake, fetch: fetchFake, embed: embedFake, llm: llmFake as ResearchDeps["llm"] };
 
 // ---------- deep-dive quality gates (unit) ----------
 const pq = practicalQueries({ id: "x", title: "Habit tracker", content: "" });
@@ -131,6 +150,55 @@ const dd = await dedupeList(["Keep it warm", "keep it WARM!", "Feed the starter"
 check("dedupeList: normalized-text and embedding duplicates removed", dd.items.join("|") === "Keep it warm|Feed the starter" && dd.removed === 2, dd);
 const wp = writeupPrompt(relIdea, [{ n: 1, scope: "related", claim: "UI adapts", quote: "q", chunk_id: "c", source_id: "s", url: "u", title: null, question: null }], []);
 check("write-up prompt forbids stretching scope and tags general evidence", /Never stretch a fact's scope/.test(wp.system) && /\[F1\] \(general\/adjacent evidence/.test(wp.user));
+
+// ---------- v3: balanced mix, quotes, uncited sentences, titles, diagrams (unit) ----------
+check("scholarlyQueries: study / research / systematic review", scholarlyQueries({ id: "x", title: "Habit tracker", content: "" }).join("|") === "Habit tracker study|Habit tracker research|Habit tracker systematic review");
+const mix = balancedMix(() => 10);
+const Pp = (u: string) => ({ url: u, title: u, site: u, type: "paper" as const, query: 0 }), Bb = (u: string) => ({ url: u, title: u, site: u, type: "blog" as const, query: 0 });
+const tp = (n: number) => Array(n).fill("paper") as any[], tb = (n: number) => Array(n).fill("blog") as any[];
+check("balancedMix: paper refused at max 50% while non-papers remain", !mix(Pp("p"), { usedTypes: [...tp(5), ...tb(2)], remaining: [Bb("b")] }));
+check("balancedMix: paper allowed past 50% when no alternatives", mix(Pp("p"), { usedTypes: [...tp(5), ...tb(2)], remaining: [Pp("q")] }));
+check("balancedMix: non-paper waits when it would eat the 30% paper reserve", !mix(Bb("b"), { usedTypes: [...tp(1), ...tb(7)], remaining: [Pp("p1"), Pp("p2")] }));
+check("balancedMix: non-paper allowed when reserve already met", mix(Bb("b"), { usedTypes: [...tp(3), ...tb(5)], remaining: [Pp("p1")] }));
+check("balancedMix: non-paper allowed when no paper candidates remain", mix(Bb("b"), { usedTypes: [...tb(8)], remaining: [Bb("c")] }));
+const chunkT = "What should a streak screen show?\nShow the qualifying action, current streak, best streak, or the next useful action. Next part here.";
+const ext = completeQuote(chunkT, "Show the qualifying action, current streak, best streak, or");
+check("completeQuote extends to sentence end, still verbatim", ext.change === "extended" && ext.quote.endsWith("next useful action.") && verifyQuote(chunkT, ext.quote), ext);
+const chunk2 = "Habits form slowly. Most users quit in the first week; streaks help some users keep going and";
+const tr = completeQuote(chunk2, "Habits form slowly. Most users quit in the first week; streaks help some users keep going and");
+check("completeQuote trims to last complete clause when the chunk ends mid-sentence", tr.change === "trimmed" && tr.quote === "Habits form slowly. Most users quit in the first week;" && verifyQuote(chunk2, tr.quote), tr);
+check("completeQuote leaves complete quotes alone", completeQuote(chunk2, "Habits form slowly.").change === "none");
+const fu = filterUncited("Starters need flour [F1]. The goal is to keep it alive. Starters are 100 years old. A baker could feed it daily.");
+check("filterUncited keeps cited and goal/suggestion sentences, drops uncited claims", fu.text === "Starters need flour [F1]. The goal is to keep it alive. A baker could feed it daily." && fu.dropped.join() === "Starters are 100 years old.", fu);
+check("pickTitle prefers h1/og:title over a generic <title> that mismatches the URL",
+  pickTitle('<html><head><title>OpenAI</title></head><body><svg><title>Claude</title></svg><h1 class="x">How to Build a Streaks Feature</h1></body></html>', "https://trophy.so/blog/how-to-build-a-streaks-feature") === "How to Build a Streaks Feature");
+check("pickTitle keeps a descriptive <title>", pickTitle('<html><head><title>The 5 best habit tracker apps | Zapier</title><meta property="og:title" content="Other"></head><h1>Y</h1></html>', "https://zapier.com/blog/x") === "The 5 best habit tracker apps | Zapier");
+check("pickTitle ignores inline SVG <title> when head has none", pickTitle('<html><head></head><body><svg><title>OpenAI</title></svg><h1>Real heading</h1></body></html>', "https://a.example/") === "Real heading");
+check("sanitizeLabel strips injection characters but keeps [F#]", sanitizeLabel('click "x" <b>bold</b> {a} `c` %%{init} [F3] ok') === "click x b bold /b a c init [F3] ok", sanitizeLabel('click "x" <b>bold</b> {a} `c` %%{init} [F3] ok'));
+check("validateMermaid accepts the generated flowchart subset", validateMermaid('flowchart TD\nn1["Starter [F1]"]\nn2["Yeast"]\nn1 -->|"feeds [F1]"| n2').ok);
+check("validateMermaid accepts the sequence subset", validateMermaid("sequenceDiagram\nparticipant n1 as Baker\nparticipant n2 as Starter\nn1->>n2: feeds flour [F1]").ok);
+for (const [name, bad] of [["click directive", 'flowchart TD\nn1["a"]\nn2["b"]\nn1 --> n2\nclick n1 "https://evil"'], ["style directive", 'flowchart TD\nn1["a"]\nn2["b"]\nn1 --> n2\nstyle n1 fill:#f00'],
+  ["init directive", '%%{init: {"securityLevel": "loose"}}%%\nflowchart TD\nn1["a"]\nn2["b"]\nn1 --> n2'], ["html label", 'flowchart TD\nn1["<img src=x onerror=alert(1)>"]\nn2["b"]\nn1 --> n2'],
+  ["undeclared node", 'flowchart TD\nn1["a"]\nn1 --> n9'], ["unsupported type", "classDiagram\nA <|-- B"], ["quote in label", 'flowchart TD\nn1["a" onclick="x"]\nn2["b"]\nn1 --> n2'],
+  ["too many nodes", "flowchart TD\n" + Array.from({ length: 16 }, (_, i) => `n${i}["x${i}"]`).join("\n") + "\nn0 --> n1"]] as const)
+  check(`validateMermaid rejects ${name}`, !validateMermaid(bad).ok);
+const spec = specToMermaid({ title: "T", type: "flowchart", nodes: [{ id: "a b", label: 'A "quoted" <x> [F1] [F9]' }, { id: "c", label: "C" }], edges: [{ from: "a b", to: "c", label: "link" }, { from: "a b", to: "zz" }] }, 2);
+check("specToMermaid: safe ids, sanitized labels, invalid refs removed, edges to unknown nodes dropped",
+  "diagram" in spec && spec.diagram.mermaid === 'flowchart TD\nn1["A quoted x [F1]"]\nn2["C"]\nn1 -->|"link"| n2' && spec.diagram.refs.join() === "1", spec);
+check("specToMermaid rejects a 1-node diagram", "error" in specToMermaid({ title: "T", type: "flowchart", nodes: [{ id: "a", label: "A" }], edges: [] }, 2));
+const gd0 = await generateDiagrams("x", [{ n: 1, claim: "a" }, { n: 2, claim: "b" }], "s", [], { llm: llmFake as ResearchDeps["llm"] });
+check("generateDiagrams skips when fewer than 3 facts", gd0.diagrams.length === 0 && /fewer than 3/.test(gd0.skipped ?? ""));
+const gd = await generateDiagrams("x", [1, 2, 3].map(n => ({ n, claim: `c${n}` })), "s", ["Related idea"], { llm: llmFake as ResearchDeps["llm"] });
+check("generateDiagrams: keeps 2 valid (flowchart + sequence), drops the invalid one, strips [F99]",
+  gd.diagrams.length === 2 && gd.dropped.length === 1 && gd.diagrams[1]!.type === "sequence" && !gd.diagrams[1]!.mermaid.includes("F99") && gd.diagrams.every(d => validateMermaid(d.mermaid).ok), gd);
+
+check("usableDeepSource: rejects short JS shells and bot-check pages, accepts real text",
+  !usableDeepSource({ text: "Europe PMC", title: "Europe PMC", error: null }) && !usableDeepSource({ text: "x".repeat(2000), title: "Making sure you're not a bot!", error: null })
+  && usableDeepSource({ text: "x".repeat(800), title: "Habit study", error: null }));
+const scr = await screenTitles(relIdea, [P("https://arxiv.org/abs/glast"), { ...P("https://arxiv.org/abs/ok"), title: "Sourdough yeast study" }, Bl("https://blog.example/x")].map((c, i) => i === 0 ? { ...c, title: "GLAST Tracker detector" } : c), { llm: llmFake as ResearchDeps["llm"] });
+check("screenTitles drops off-field scholarly titles via the judge; non-papers are not screened", scr.kept.map(c => c.url).join() === "https://arxiv.org/abs/ok,https://blog.example/x" && scr.dropped.length === 1, scr);
+const scrFail = await screenTitles(relIdea, [P("https://arxiv.org/abs/a")], { llm: () => Promise.resolve("nope") });
+check("screenTitles keeps candidates when the judge fails", scrFail.kept.length === 1 && scrFail.dropped.length === 0);
 
 // ---------- store + mocked deep dive ----------
 const store = createSkillStore(db);
@@ -162,6 +230,13 @@ check("tags lowercased", res.tags.join() === "baking,fermentation");
 check("deep dive searched practical query variants", pq.length === 5 && searchQueries.some(q => / guide$/.test(q)) && searchQueries.some(q => /^how to /.test(q)) && searchQueries.some(q => / best practices$/.test(q)), searchQueries.slice(-6));
 check("off-domain title dropped before fetching", !fetchedUrls.includes("https://physics.example/streaks") && (res.stats.candidatesDropped as any[]).some(d => /streaks/.test(d.url)));
 check("off-topic fact (judge) dropped and reported", (res.stats.droppedOffTopic as number) >= 1 && !kf.some(f => /bread/i.test(f.claim)), res.stats.offTopic);
+check("scholarly queries routed to the science search, others not", scienceQueries.length === 3 && scienceQueries.every(q => / (study|research|systematic review)$/.test(q)) && !searchQueries.some(q => / study$/.test(q)), { scienceQueries });
+check("off-field scholarly candidate screened out before fetching", !fetchedUrls.includes("https://arxiv.org/abs/glast") && (res.stats.candidatesDropped as any[]).some(d => /glast/.test(d.url)));
+check("paper source fetched and its facts verified like any other", fetchedUrls.includes("https://arxiv.org/abs/sourdough") && (res.stats.factTypes as any).paper >= 1, res.stats.factTypes);
+check("uncited plain claim dropped from overview", (res.stats.uncitedDropped as string[]).some(x => /Mars/.test(x)) && !ov.text!.includes("Mars"), res.stats.uncitedDropped);
+const dsec = res.sections.find(s => s.key === "diagrams");
+check("diagrams section: synthesis, 2 valid mermaid diagrams, placed before practical steps", !!dsec && dsec.kind === "synthesis" && dsec.items!.length === 2
+  && res.sections.findIndex(s => s.key === "diagrams") === res.sections.findIndex(s => s.key === "practical_steps") - 1, dsec);
 check("steps/open questions deduped", (res.sections.find(s => s.key === "practical_steps")!.items as string[]).length === 2 && (res.stats.dedupeRemoved as any).steps === 1 && (res.stats.dedupeRemoved as any).openQuestions >= 1, res.stats.dedupeRemoved);
 check("sources linked to existing research_sources", res.sources.length > 0 && res.sources.every(s => n("SELECT COUNT(*) n FROM research_sources WHERE id = ?", s.source_id) === 1));
 check("stats include duration + section lengths", typeof res.stats.total_ms === "number" && typeof (res.stats.sectionChars as any).overview === "number");
@@ -226,8 +301,8 @@ r = await app.inject({ method: "GET", url: "/skills?q=zzzz_no_match%25" });
 check("GET /skills?q= no match (LIKE wildcards escaped)", r.statusCode === 200 && r.json().length === 0);
 r = await app.inject({ method: "GET", url: `/skills/${created.skillId}` });
 const d = r.json();
-check("GET /skills/:id full content: 6 sections, findings with urls, sources, 2 versions, parent idea",
-  r.statusCode === 200 && d.sections.length === 6 && d.findings.length > 0 && d.findings.every((f: any) => /^https:/.test(f.url)) && d.sources.length > 0 && d.versions.length === 2 && d.idea.id === idea.id && d.viewVersion === 2, { s: r.statusCode, v: d.versions, vv: d.viewVersion });
+check("GET /skills/:id full content: 6 sections (+diagrams), findings with urls, sources, 2 versions, parent idea",
+  r.statusCode === 200 && d.sections.length === (d.sections.some((x: any) => x.key === "diagrams") ? 7 : 6) && d.findings.length > 0 && d.findings.every((f: any) => /^https:/.test(f.url)) && d.sources.length > 0 && d.versions.length === 2 && d.idea.id === idea.id && d.viewVersion === 2, { s: r.statusCode, v: d.versions, vv: d.viewVersion });
 r = await app.inject({ method: "GET", url: `/skills/${created.skillId}?version=1` });
 check("GET /skills/:id?version=1 returns old version", r.statusCode === 200 && r.json().viewVersion === 1);
 r = await app.inject({ method: "GET", url: `/skills/${created.skillId}?version=9` });

@@ -22,7 +22,9 @@ export type ResearchRoutesOptions = {
 const STATIC_FILES: Record<string, { file: string; type: string }> = {
   "/": { file: "index.html", type: "text/html; charset=utf-8" },
   "/dashboard/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
-  "/dashboard/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" }
+  "/dashboard/styles.css": { file: "styles.css", type: "text/css; charset=utf-8" },
+  // Vendored Mermaid 11.17.2 (MIT, from the npm package dist/mermaid.min.js; no CDN). Loaded only on skill pages with diagrams.
+  "/dashboard/mermaid.min.js": { file: "mermaid.min.js", type: "text/javascript; charset=utf-8" }
 };
 
 const DEFAULT_DASHBOARD_DIR = fileURLToPath(new URL("../../dashboard/", import.meta.url));

@@ -19,6 +19,11 @@ check("router handles #/skills and #/skill/<id>@<version>", js.includes('h === "
 check("uses the skills API routes", ["/skills/${encodeURIComponent(id)}/refresh", "/ideas/${encodeURIComponent(ideaId)}/skill", "/skills${skillQuery"].every(s => js.includes(s)));
 check("never uses innerHTML/eval", !/innerHTML|outerHTML|insertAdjacentHTML|eval\(|new Function/.test(js));
 check("synthesis vs verified labels present", js.includes('"synthesis"') && js.includes("verified facts") && css.includes(".kind.synthesis"));
+const mm = await app.inject({ method: "GET", url: "/dashboard/mermaid.min.js" });
+check("vendored mermaid served locally from the allowlist", mm.statusCode === 200 && mm.body.includes('globalThis["mermaid"]') && /javascript/.test(String(mm.headers["content-type"])));
+check("mermaid loaded from /dashboard only, strict security, SVG imported via DOMParser",
+  js.includes('sc.src = "/dashboard/mermaid.min.js"') && js.includes('securityLevel: "strict"') && js.includes('parseFromString(svg, "image/svg+xml")'));
+check("other dashboard paths still 404 (allowlist)", (await app.inject({ method: "GET", url: "/dashboard/package.json" })).statusCode === 404);
 check("GET /skills 200 on the copy", (await app.inject({ method: "GET", url: "/skills" })).statusCode === 200);
 await app.close();
 console.log(`\n${pass} passed, ${fail} failed`);

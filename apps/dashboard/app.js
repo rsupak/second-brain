@@ -269,6 +269,33 @@ async function skills() {
   input.focus();
 }
 
+// Mermaid is vendored locally (/dashboard/mermaid.min.js) and loaded on demand; securityLevel "strict".
+let mermaidReady = null;
+function loadMermaid() {
+  if (!mermaidReady) mermaidReady = new Promise((resolve, reject) => {
+    const sc = document.createElement("script");
+    sc.src = "/dashboard/mermaid.min.js";
+    sc.onload = () => { try { window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral", flowchart: { htmlLabels: false } }); resolve(window.mermaid); } catch (e) { reject(e); } };
+    sc.onerror = () => reject(new Error("mermaid.min.js failed to load"));
+    document.head.append(sc);
+  });
+  return mermaidReady;
+}
+let diagramSeq = 0;
+function diagramBox(d) {
+  const target = el("div", { class: "diagram" }, el("span", { class: "muted small" }, "Rendering diagram…"));
+  const code = el("details", {}, el("summary", { class: "small muted" }, "Mermaid source"), el("pre", {}, d.mermaid));
+  loadMermaid().then(async (m) => {
+    const { svg } = await m.render(`skill-diagram-${++diagramSeq}`, d.mermaid);
+    // Parse the (strict-mode, sanitized) SVG as XML and import the node; no HTML parsing of untrusted text.
+    const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+    const root = doc.documentElement;
+    if (root.nodeName.toLowerCase() !== "svg") throw new Error("renderer did not return SVG");
+    target.replaceChildren(document.importNode(root, true));
+  }).catch(e => target.replaceChildren(el("div", { class: "notice warn small" }, `Diagram could not be rendered (${e && e.message ? e.message : e}); source below.`)));
+  return el("div", { class: "diagram-wrap" }, el("div", { class: "small" }, el("strong", {}, d.title), d.refs && d.refs.length ? el("span", { class: "muted" }, ` · uses ${d.refs.map(n => `F${n}`).join(", ")}`) : null), target, code);
+}
+
 function citeText(text) {
   // Renders "[F3]" citations as links to the fact anchors; everything else stays a text node.
   const parts = String(text || "").split(/(\[F\d+\])/g);
@@ -316,6 +343,8 @@ async function skillDetail(id, version) {
         el("div", { class: "claim" }, `F${f.n}. `, f.claim), el("blockquote", {}, f.quote),
         el("div", { class: "small" }, safeLink(f.url, f.title || f.url), el("span", { class: "muted" }, ` · ${f.sourceType} · ${f.site}${f.question ? ` · Q: ${f.question}` : ""}`))))
         : el("p", { class: "muted" }, "No verified facts.")) : null,
+      sec("diagrams") ? el("section", { class: "card" }, head(sec("diagrams")), el("p", { class: "muted small" }, "Generated from the verified facts and the synthesis; nodes that state a fact cite it as [F#]."),
+        (sec("diagrams").items || []).map(diagramBox)) : null,
       list("practical_steps", true), list("open_questions", false),
       el("section", { class: "card" }, el("h3", {}, "Related ", el("span", { class: "kind computed" }, "embedding similarity")),
         el("div", {}, el("strong", {}, "Skills: "), rel.skills.length ? rel.skills.map((x, i) => [i ? ", " : "", el("a", { href: `#/skill/${encodeURIComponent(x.id)}` }, x.title), el("span", { class: "muted small" }, ` (${x.similarity})`)]) : el("span", { class: "muted" }, "none yet")),

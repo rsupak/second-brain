@@ -15,6 +15,7 @@ ensureSkillTables(db);
 const POLL_MS = 5000;
 const store = createSkillStore(db);
 const search = searxngSearch();
+const searchScience = searxngSearch(undefined, { categories: "science" });   // scholarly queries only
 const ONCE = process.env.DEEP_DIVE_ONCE === "1";   // test mode: process one job then exit
 
 async function processJob(job: DeepDiveJob) {
@@ -24,7 +25,7 @@ async function processJob(job: DeepDiveJob) {
     if (!idea) throw new Error("Idea not found");
     console.log(`Deep dive v${version}: ${idea.title}`);
     const v = await runDeepDive(db, skillId, idea, {
-      search, fetch: liveFetch, embed: texts => embedTexts(texts), llm: generateResponse,
+      search, searchScience, fetch: liveFetch, embed: texts => embedTexts(texts), llm: generateResponse,
       log: m => console.log(`  ${m}`), stillOwned: () => store.owns(job)
     });
     const result = store.complete(job, v);

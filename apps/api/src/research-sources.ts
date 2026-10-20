@@ -137,7 +137,7 @@ export async function fetchSource(url: string, opts: FetchOptions = {}): Promise
         throw new Error(`Unsupported content type: ${mime || "(none)"}`);
       }
       const raw = decode(await readCapped(res, maxBytes), contentType);
-      const extracted = mime === "text/html" ? extractHtml(raw) : { title: null, text: normalizeText(raw) };
+      const extracted = mime === "text/html" ? extractHtml(raw, current.toString()) : { title: null, text: normalizeText(raw) };
       if (!extracted.text) throw new Error("No readable text extracted");
       result.title = extracted.title;
       result.text = extracted.text;
@@ -177,9 +177,32 @@ export function normalizeText(s: string): string {
 
 const DROP = ["script", "style", "noscript", "template", "svg", "nav", "header", "footer", "aside", "form", "iframe", "button"];
 
-export function extractHtml(html: string): { title: string | null; text: string } {
-  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
-  const title = titleMatch ? normalizeText(decodeEntities(titleMatch[1]!.replace(/<[^>]+>/g, ""))).replace(/\n/g, " ") || null : null;
+const cleanTitle = (t: string | undefined | null) => t ? normalizeText(decodeEntities(t.replace(/<[^>]+>/g, ""))).replace(/\n/g, " ").slice(0, 300) || null : null;
+const words = (s: string) => new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length >= 4));
+
+/**
+ * Page title: <title> from <head> (not inline SVG <title>s). If it is missing, or looks generic (at most 2 words
+ * sharing no word with the URL host/path) while og:title or the first <h1> exists, the better candidate is used.
+ */
+export function pickTitle(html: string, url?: string): string | null {
+  const head = /<head\b[^>]*>([\s\S]*?)<\/head>/i.exec(html)?.[1] ?? "";
+  const headTitle = cleanTitle(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(head)?.[1]);
+  const anyTitle = headTitle ?? (head ? null : cleanTitle(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1]));
+  const og = cleanTitle(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']*)["']/i.exec(html)?.[1]
+    ?? /<meta[^>]+content=["']([^"']*)["'][^>]*property=["']og:title["']/i.exec(html)?.[1]);
+  const h1 = cleanTitle(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]);
+  const alt = og ?? h1;
+  if (!anyTitle) return alt;
+  if (!alt || !url) return anyTitle;
+  let urlWords = new Set<string>();
+  try { const u = new URL(url); urlWords = words(`${u.hostname} ${decodeURIComponent(u.pathname)}`); } catch { /* keep empty */ }
+  const tw = [...words(anyTitle)];
+  const generic = anyTitle.split(/\s+/).length <= 2 && !tw.some(w => urlWords.has(w));
+  return generic ? alt : anyTitle;
+}
+
+export function extractHtml(html: string, url?: string): { title: string | null; text: string } {
+  const title = pickTitle(html, url);
 
   let s = html.replace(/<!--[\s\S]*?-->/g, " ").replace(/<head[\s\S]*?<\/head>/i, " ");
   for (const tag of DROP) {
