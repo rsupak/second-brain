@@ -27,6 +27,7 @@ import Database from "better-sqlite3";
 import { researchRoutes } from "./research-routes.js";
 import { skillsRoutes } from "./skills-routes.js";
 import { conversationsRoutes } from "./conversations-routes.js";
+import { chatRoutes } from "./chat-routes.js";
 import { addCrossSiteGuard } from "./security.js";
 import { createResearchJobStore } from "./research-jobs.js";
 
@@ -142,6 +143,28 @@ app.get("/memories/semantic-search", async (request, reply) => {
   return semanticSearch(result.data.q);
 });
 
+// POST /ideas logic, shared with web/voice "make this an idea" (same auto-queueing, same response shape).
+function createUserIdea(title: string, content: string, log: { error: (o: unknown, m?: string) => void }) {
+  const result = createOriginalIdea(
+    title,
+    content
+  );
+
+  // Auto-queue evaluation and research for user-created ideas only (worker child ideas don't pass through here).
+  // Additive response fields; failures are logged and never fail the idea creation.
+  const extra: { evaluationJobId?: string | null; researchJobId?: string | null } = {};
+  if (process.env.AUTO_EVALUATE !== "0") {
+    try { extra.evaluationJobId = queueEvaluationForIdea(result.idea.id); }
+    catch (error) { log.error(error, "Auto-evaluate queue failed"); extra.evaluationJobId = null; }
+  }
+  if (process.env.AUTO_RESEARCH !== "0") {
+    try { extra.researchJobId = createResearchJobStore(researchDb).enqueue(result.idea.id); }
+    catch (error) { log.error(error, "Auto-research queue failed"); extra.researchJobId = null; }
+  }
+
+  return { ...result, ...extra };
+}
+
 app.post("/ideas", async (request, reply) => {
   const parsed = z.object({
     title: z.string().trim().min(1).max(200),
@@ -155,24 +178,7 @@ app.post("/ideas", async (request, reply) => {
     });
   }
 
-  const result = createOriginalIdea(
-    parsed.data.title,
-    parsed.data.content
-  );
-
-  // Auto-queue evaluation and research for user-created ideas only (worker child ideas don't pass through here).
-  // Additive response fields; failures are logged and never fail the idea creation.
-  const extra: { evaluationJobId?: string | null; researchJobId?: string | null } = {};
-  if (process.env.AUTO_EVALUATE !== "0") {
-    try { extra.evaluationJobId = queueEvaluationForIdea(result.idea.id); }
-    catch (error) { request.log.error(error, "Auto-evaluate queue failed"); extra.evaluationJobId = null; }
-  }
-  if (process.env.AUTO_RESEARCH !== "0") {
-    try { extra.researchJobId = createResearchJobStore(researchDb).enqueue(result.idea.id); }
-    catch (error) { request.log.error(error, "Auto-research queue failed"); extra.researchJobId = null; }
-  }
-
-  return reply.code(201).send({ ...result, ...extra });
+  return reply.code(201).send(createUserIdea(parsed.data.title, parsed.data.content, request.log));
 });
 
 app.get("/ideas", async () => listIdeas());
@@ -229,6 +235,7 @@ researchDb.pragma("busy_timeout = 5000");
 app.register(researchRoutes, { db: researchDb });
 app.register(skillsRoutes, { db: researchDb });
 app.register(conversationsRoutes, { db: researchDb });
+app.register(chatRoutes, { db: researchDb, createIdea: async (title, content) => { const r = createUserIdea(title, content, app.log); return { id: r.idea.id, title: r.idea.title }; } });
 
 async function start() {
   try {

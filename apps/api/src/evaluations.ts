@@ -59,7 +59,7 @@ export type Evaluation = z.infer<typeof EvaluationSchema>;
 export function queueEvaluations() {
   const ideas = db.prepare(`
     SELECT id FROM ideas
-    WHERE id NOT IN (
+    WHERE origin != 'topic' AND id NOT IN (
       SELECT idea_id FROM idea_evaluations
     )
   `).all() as { id: string }[];

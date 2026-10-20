@@ -26,9 +26,12 @@ const cases: Array<[string, string, any?]> = [
   ["Close.", "close"], ["We're done.", "close"], ["Done for now.", "close"], ["That's all.", "close"],
   ["Bailey, capture a new idea: a solar powered soil sensor.", "capture", { content: "a solar powered soil sensor." }],
   ["New idea: open source bird feeder camera", "capture"],
+  ["Bailey, Capture and You Idea, a solar-powered soil moisture sensor.", "capture", { content: "a solar-powered soil moisture sensor." }],
   ["What is the boiling point of water?", "question"], ["How should I handle missed days?", "question"],
   ["No, I think the battery matters more than the screen because it runs outside all year long.", "question"],
-  ["Open source licenses, what do they mean?", "open"] // documented ambiguity: "open X" always means open-idea
+  ["Open source licenses, what do they mean?", "open", { strong: false }], // only opens if it matches an idea; else a question
+  ["Let's talk about the habit tracker", "open", { strong: true }],
+  ["Make this an idea.", "make_idea"], ["Bailey, turn this into an idea", "make_idea"], ["Save this as an idea", "make_idea"]
 ];
 for (const [text, kind, fields] of cases) {
   const r: any = parseIntent(text);
@@ -40,7 +43,9 @@ for (const [text, kind, fields] of cases) {
 {
   const facts: Fact[] = [{ tag: "F1", text: "Streak freezes reduce churn.", source: "research", sim: 0.7 }, { tag: "F2", text: "x", source: "skill", sim: 0.5 }];
   const g = finishGrounded("Streak freezes help keep users [F1]. Keep it simple [F1, F2].", facts);
-  check("finishGrounded strips tags + says basis", g.text === "From your research: Streak freezes help keep users. Keep it simple." && g.used.join() === "F1,F2", g.text);
+  check("finishGrounded strips tags + says basis only for verified citations", g.text === "From your research: Streak freezes help keep users. Keep it simple." && g.used.join() === "F1", `${g.text} used=${g.used}`);
+  const g5 = finishGrounded("Suggest one small next action after a miss [F1].", facts);
+  check("finishGrounded: unsupported citation -> no 'from your research'", g5.used.length === 0 && g5.text === "Suggest one small next action after a miss.", g5.text);
   const g2 = finishGrounded("I don't have research on that.", facts);
   check("finishGrounded leaves ungrounded answers alone", g2.text === "I don't have research on that." && g2.used.length === 0);
   const g4 = finishGrounded("Get back on track [IDEA]. Then rest [EVALUATION].", facts); check("finishGrounded strips stray [IDEA] labels", g4.text === "Get back on track. Then rest.", g4.text);
@@ -60,11 +65,13 @@ const db = new Database(dbPath); db.pragma("journal_mode = WAL"); db.pragma("bus
 const before = conversationCounts(db);
 const { embedTexts, generateResponse } = await import("./ai.js");
 const MODEL = process.env.VOICE_MODEL ?? "gemma4:e4b-it-qat";
-let clock = Date.now(); const skillCalls: string[] = [];
+let clock = Date.now(); const skillCalls: string[] = []; const ideaCalls: Array<{ t: string; c: string }> = []; const topicCalls: Array<{ t: string; sd: string }> = [];
 const ex = createExplorer({
   db, model: MODEL, embed: xs => embedTexts(xs),
   llm: (m, o) => generateResponse(m, { model: MODEL, think: false, temperature: o?.temperature ?? 0.3, numPredict: o?.numPredict ?? 150, numCtx: 4096, timeoutMs: 90_000 }),
   captureIdea: async c => ({ id: "fake", title: c }), createSkill: async id => { skillCalls.push(id); return { status: 202, body: { skillId: "x" } }; },
+  createIdea: async (t, c) => { ideaCalls.push({ t, c }); return { id: byTitle("Adaptive Streak Recovery"), title: t }; },
+  createTopicSkill: async (t, sd) => { topicCalls.push({ t, sd }); return { status: 202, body: { skillId: "topic-x" } }; },
   generalAnswer: async () => "general answer", now: () => clock, log: (...a) => console.log("   log:", ...a.map(String))
 });
 const byTitle = (t: string) => db.prepare(`SELECT id FROM ideas WHERE title LIKE ?`).pluck().get(t + "%") as string;
@@ -121,8 +128,14 @@ const say = async (t: string) => { const r = await ex.handle(DEV, t); console.lo
   check("note saved as note turn", r.reply === "Noted." && ex.store.turns(r.sessionId!).some(t => t.role === "note" && /streak freeze/.test(t.text)));
   r = await say("What's its evaluation?");
   check("evaluation reads scores", /^Feasibility \d, cost \d, relevance \d, novelty \d/.test(r.reply), r.reply);
+  r = await say("Make this an idea.");
+  check("voice make_idea: reads title back, asks to save", r.intent === "make_idea" && /^The idea is: .+\. Save it\?$/.test(r.reply) && ideaCalls.length === 0, r.reply);
+  r = await say("Yes.");
+  check("voice make_idea yes: POST /ideas logic called with grounded draft + session linked", ideaCalls.length === 1 && /Saved\./.test(r.reply) && ex.store.links(r.sessionId!).some(l => l.kind === "created_idea"), `${r.reply} draft=${JSON.stringify(ideaCalls[0])}`);
   r = await say("Make this a skill.");
-  check("skill uses createSkill for the active idea", skillCalls.at(-1) === habit && /deep dive/.test(r.reply), r.reply);
+  check("voice skill: asks before queueing (fits active idea)", r.intent === "skill" && /^Start a deep dive on Habit tracker/.test(r.reply) && skillCalls.length === 0, r.reply);
+  r = await say("Yes.");
+  check("skill yes uses createSkill for the active idea", skillCalls.at(-1) === habit && /queued a deep dive/.test(r.reply), r.reply);
   const sid = r.sessionId!;
   r = await say("Close.");
   await ex.flush();
@@ -157,6 +170,17 @@ const say = async (t: string) => { const r = await ex.handle(DEV, t); console.lo
   await say("Let's talk about the artwork timeline."); await say("Yes."); const sw = ex.store.activeForDevice(DEV)!;
   clock += 11 * 60 * 1000; ex.sweepIdle(); await ex.flush();
   check("sweepIdle closes idle sessions", ex.store.getSession(sw.id)?.end_reason === "timeout");
+  // bare "open X" without a matching idea is a question
+  r = await say("Open source licenses, what do they mean?");
+  check("bare 'open X' with no match is answered as a question", r.intent === "general", r.intent);
+  // topic skill from a general (idea-less) voice conversation
+  r = await say("Add this as a skill.");
+  check("voice topic skill: proposes a topic, asks first", r.intent === "skill" && /^Start a deep dive on the topic .+\?$/.test(r.reply) && topicCalls.length === 0, r.reply);
+  r = await say("No.");
+  check("voice topic skill: no -> nothing queued", topicCalls.length === 0 && /won't save/.test(r.reply), r.reply);
+  r = await say("Add this as a skill.");
+  r = await say("Yes.");
+  check("voice topic skill: yes -> createTopicSkill with seed text", topicCalls.length === 1 && /queued a deep dive/.test(r.reply), `${r.reply} ${JSON.stringify(topicCalls[0])}`);
   r = await say("Bailey, capture a new idea: a solar powered soil sensor.");
   check("new idea capture path still works", r.intent === "capture" && /saved your idea/.test(r.reply));
 }

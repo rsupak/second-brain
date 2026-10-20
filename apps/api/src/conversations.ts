@@ -34,6 +34,14 @@ export function ensureConversationTables(db: Database.Database) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_conv_turns_session ON conversation_turns(session_id, created_at);
+    -- What a conversation produced or was attached to: created_idea, queued_skill, created_topic_skill, attached_idea.
+    CREATE TABLE IF NOT EXISTS conversation_links (
+      session_id TEXT NOT NULL REFERENCES conversation_sessions(id),
+      kind TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (session_id, kind, target_id)
+    );
     CREATE TABLE IF NOT EXISTS idea_conversation_summaries (
       idea_id TEXT PRIMARY KEY REFERENCES ideas(id),
       summary TEXT NOT NULL,
@@ -46,7 +54,7 @@ export function ensureConversationTables(db: Database.Database) {
 
 export function conversationCounts(db: Database.Database) {
   const n = (t: string) => { try { return db.prepare(`SELECT count(*) FROM ${t}`).pluck().get() as number; } catch { return null; } };
-  return { conversation_messages: n("conversation_messages"), conversation_sessions: n("conversation_sessions"), conversation_turns: n("conversation_turns"),
+  return { conversation_messages: n("conversation_messages"), conversation_sessions: n("conversation_sessions"), conversation_turns: n("conversation_turns"), conversation_links: n("conversation_links"),
     idea_conversation_summaries: n("idea_conversation_summaries"), ideas: n("ideas"), idea_embeddings: n("idea_embeddings") };
 }
 
@@ -71,6 +79,10 @@ export function createConversationStore(db: Database.Database, now = () => Date.
     recentForIdea: db.prepare(`SELECT t.* FROM conversation_turns t JOIN conversation_sessions s ON s.id = t.session_id
       WHERE s.idea_id = ? ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?`),
     summary: db.prepare(`SELECT * FROM idea_conversation_summaries WHERE idea_id = ?`),
+    insLink: db.prepare(`INSERT OR IGNORE INTO conversation_links (session_id, kind, target_id, created_at) VALUES (?,?,?,?)`),
+    links: db.prepare(`SELECT kind, target_id, created_at FROM conversation_links WHERE session_id = ? ORDER BY created_at`),
+    attachIfNone: db.prepare(`UPDATE conversation_sessions SET idea_id = ? WHERE id = ? AND idea_id IS NULL`),
+    webSessions: db.prepare(`SELECT * FROM conversation_sessions WHERE channel = 'web' AND (? IS NULL OR idea_id = ?) ORDER BY last_activity_at DESC LIMIT ?`),
     putSummary: db.prepare(`INSERT INTO idea_conversation_summaries (idea_id, summary, model, last_session_id, updated_at) VALUES (?,?,?,?,?)
       ON CONFLICT(idea_id) DO UPDATE SET summary = excluded.summary, model = excluded.model, last_session_id = excluded.last_session_id, updated_at = excluded.updated_at`)
   };
@@ -96,6 +108,12 @@ export function createConversationStore(db: Database.Database, now = () => Date.
     ideaSessions: (ideaId: string, limit = 50) => q.ideaSessions.all(ideaId, limit) as Session[],
     /** Last N turns for an idea across ALL channels and sessions, oldest first. */
     recentForIdea: (ideaId: string, limit = 8) => (q.recentForIdea.all(ideaId, limit) as Turn[]).reverse(),
+    /** Records what the session produced; a created idea also becomes the session's idea if it had none. */
+    link(sessionId: string, kind: string, targetId: string) {
+      db.transaction(() => { q.insLink.run(sessionId, kind, targetId, now()); if (kind === "created_idea" || kind === "attached_idea") q.attachIfNone.run(targetId, sessionId); })();
+    },
+    links: (sessionId: string) => q.links.all(sessionId) as Array<{ kind: string; target_id: string; created_at: number }>,
+    webSessions: (ideaId: string | null, limit = 50) => q.webSessions.all(ideaId, ideaId, limit) as Session[],
     getSummary: (ideaId: string) => q.summary.get(ideaId) as { idea_id: string; summary: string; model: string; last_session_id: string | null; updated_at: number } | undefined,
     putSummary: (ideaId: string, summary: string, model: string, sessionId: string | null) => q.putSummary.run(ideaId, summary, model, sessionId, now())
   };

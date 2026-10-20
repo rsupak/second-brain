@@ -7,7 +7,7 @@ import { networkInterfaces } from "node:os";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 import { Whisper, Piper, createOpusDecoder, encodeOpusFrames, rms, FRAME_MS, SAMPLE_RATE } from "./engines.js";
-import { captureIdea, answer, splitSentences, createSkill, VOICE_MODEL } from "./brain.js";
+import { captureIdea, answer, splitSentences, createSkill, postIdea, createTopicSkill, VOICE_MODEL } from "./brain.js";
 import { createExplorer } from "./explore.js";
 import Database from "better-sqlite3";
 import { filterTranscript, audioGate } from "./filters.js";
@@ -135,7 +135,7 @@ const explorer = createExplorer({
   db: brainDb, model: VOICE_MODEL, log,
   embed: async xs => (await import("../ai.js")).embedTexts(xs),
   llm: async (m, o) => (await import("../ai.js")).generateResponse(m, { model: VOICE_MODEL, think: false, temperature: o?.temperature ?? 0.3, numPredict: o?.numPredict ?? 150, numCtx: 4096, timeoutMs: 60_000 }),
-  captureIdea, createSkill, generalAnswer: answer
+  captureIdea, createSkill, createIdea: postIdea, createTopicSkill, generalAnswer: answer
 });
 // Idle sessions (>10 min, CONVERSATION_IDLE_MS) are closed and summarized even if the device stays quiet.
 const sweep = setInterval(() => { try { explorer.sweepIdle(); } catch (e) { log("idle sweep failed", e); } }, 60_000); sweep.unref();

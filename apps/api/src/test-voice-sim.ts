@@ -126,14 +126,32 @@ async function main() {
       console.log(`LATENCY [explore:${label}] stt=${r.sttMs}ms brain=${r.brainMs}ms first_audio=${r.firstAudioMs}ms total=${r.totalMs}ms`);
       return { ...r, stt, said };
     };
+    // Web chat on the idea first (test API, same DB copy): the voice recap must include it.
+    const API = process.env.VOICE_API_URL ?? "http://127.0.0.1:3433";
+    const jpost = async (path: string, body: unknown) => { const r = await fetch(API + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); return { status: r.status, body: await r.json() as any }; };
+    const { default: Db0 } = await import("better-sqlite3"); const db0 = new Db0(exploreDb, { readonly: true });
+    const habitId = db0.prepare(`SELECT id FROM ideas WHERE title LIKE 'Habit tracker%'`).pluck().get() as string; db0.close();
+    const ws1 = await jpost("/chat/sessions", { ideaId: habitId });
+    const wm = await jpost(`/chat/sessions/${ws1.body.session.id}/messages`, { text: "Could the habit tracker send a weekly email digest of my streaks?" });
+    transcript.push(`[web] Richard: Could the habit tracker send a weekly email digest of my streaks?`, `[web] Bailey: ${wm.body.messages?.find((m: any) => m.role === "assistant")?.text?.replace(/\s+/g, " ")}`);
+    const wc = await jpost(`/chat/sessions/${ws1.body.session.id}/close`, {});
+    check("[web] chat on the idea answered and closed", wm.status === 200 && wc.body.closed === true, `${wm.status} ${JSON.stringify(wc.body)}`);
+    { const { default: Db1 } = await import("better-sqlite3"); const d1 = new Db1(exploreDb, { readonly: true }); const t0 = Date.now(); let sm: string | undefined;
+      while (Date.now() - t0 < 90_000) { sm = d1.prepare(`SELECT summary FROM idea_conversation_summaries WHERE idea_id = ?`).pluck().get(habitId) as string | undefined; if (sm) break; await new Promise(r => setTimeout(r, 1000)); }
+      d1.close(); check("[web] summary written after web close", !!sm, sm); transcript.push(`[web summary] ${sm}`); }
     const open = await turn("open", "Let's talk about the habit tracker.");
     check("[explore] open -> confirm title aloud", open.said === "Habit tracker with small next actions?", open.said);
     const yes = await turn("confirm", "Yes, that's it.");
     check("[explore] confirm -> recap", /^Okay, Habit tracker with small next actions\./.test(yes.said) && yes.said.length <= 300, yes.said);
+    check("[explore] voice recap includes the web chat (email digest)", /e-?mail|digest/i.test(yes.said), yes.said);
     const q = await turn("question", "How should the app handle missed days?");
     check("[explore] grounded question answered within caps", q.said.length > 0 && q.said.length <= 300 && !/\[F\d/.test(q.said) && !/the user (is|wants|asked)|i need to|<\/?think>/i.test(q.said), q.said);
     const note = await turn("note", "Add a note: try a streak freeze after two missed days.");
     check("[explore] note acknowledged", note.said === "Noted.", note.said);
+    const mk = await turn("make_idea", "Make this an idea.");
+    check("[explore] 'make this an idea' reads the title back and asks", /^The idea is: .+\. Save it\?$/.test(mk.said), mk.said);
+    const mky = await turn("make_idea_yes", "Yes.");
+    check("[explore] yes -> saved via POST /ideas", /^Saved\./.test(mky.said), mky.said);
     const close = await turn("close", "Close.");
     check("[explore] close acknowledged", /closing Habit tracker/.test(close.said), close.said);
     const Database = (await import("better-sqlite3")).default; const db = new Database(exploreDb, { readonly: true });
@@ -141,9 +159,19 @@ async function main() {
     while (Date.now() - t0 < 120_000) { summary = db.prepare(`SELECT s.summary FROM idea_conversation_summaries s JOIN ideas i ON i.id = s.idea_id WHERE i.title LIKE 'Habit tracker%'`).pluck().get() as string | undefined; if (summary) break; await new Promise(r => setTimeout(r, 2000)); }
     const sess = db.prepare(`SELECT * FROM conversation_sessions WHERE device_id = ? ORDER BY started_at DESC LIMIT 1`).get(DEVICE) as any;
     const turns = sess ? db.prepare(`SELECT role, text, channel FROM conversation_turns WHERE session_id = ? ORDER BY created_at, rowid`).all(sess.id) as any[] : [];
-    check("[explore] session persisted: closed by user, user/assistant/note turns on voice channel", sess?.end_reason === "user" && turns.some(t => t.role === "note" && /streak freeze/i.test(t.text)) && turns.every(t => t.channel === "voice") && turns.filter(t => t.role === "user").length === 1, `${sess?.end_reason} ${turns.map(t => t.role).join(",")}`);
+    check("[explore] session persisted: closed by user, user/assistant/note turns on voice channel", sess?.end_reason === "user" && turns.some(t => t.role === "note" && /streak freeze/i.test(t.text)) && turns.every(t => t.channel === "voice") && turns.filter(t => t.role === "user").length >= 1, `${sess?.end_reason} ${turns.map(t => t.role).join(",")}`);
     check("[explore] summary written after close", !!summary, `${Date.now() - t0}ms: ${summary}`);
+    const links = sess ? db.prepare(`SELECT kind FROM conversation_links WHERE session_id = ?`).pluck().all(sess.id) as string[] : [];
+    check("[explore] voice session linked to the created idea", links.includes("created_idea"), links.join(","));
     db.close();
+    // Topic skill (queued only, no worker on the copy) can be opened by voice by its name.
+    const tsk = await jpost("/skills/topic", { topic: "Zettelkasten note linking", seed: "The Zettelkasten method links small atomic notes into a network of ideas." });
+    check("[topic] POST /skills/topic queued", tsk.status === 202, JSON.stringify(tsk.body));
+    const to = await turn("open_topic", "Let's talk about Zettelkasten note linking.");
+    check("[topic] voice opens the topic skill by name", to.said === "Zettelkasten note linking?", to.said);
+    const toy = await turn("open_topic_yes", "Yes.");
+    check("[topic] confirm -> recap for the topic", /^Okay, Zettelkasten note linking\./.test(toy.said), toy.said);
+    await turn("close_topic", "Close.");
     console.log("TRANSCRIPT\n  " + transcript.join("\n  ") + `\n  [summary] ${summary}`);
   }
 

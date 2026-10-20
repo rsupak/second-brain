@@ -2,14 +2,15 @@
 // Pure helpers (parseIntent, rankIdeas, decideMatch, buildContext, groundSummary) are unit-tested; Explorer wires them to the DB.
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { capReply } from "./filters.js";
+import { capReply, stripReasoning } from "./filters.js";
 import { parseCapture } from "./brain.js";
 import { createConversationStore, loadIdeaVectors, IDLE_MS, type ConversationStore, type Session, type Turn } from "../conversations.js";
 import { cosine, fromBlob } from "../research.js";
 
 export type Intent =
   | { kind: "capture"; content: string }
-  | { kind: "open"; query: string; verb: "open" | "switch" }
+  | { kind: "open"; query: string; verb: "open" | "switch"; strong: boolean }
+  | { kind: "make_idea" }
   | { kind: "yes" } | { kind: "no" } | { kind: "pick"; index: number }
   | { kind: "note"; text: string }
   | { kind: "skill" } | { kind: "evaluation" } | { kind: "close" }
@@ -24,9 +25,12 @@ export function parseIntent(raw: string): Intent {
   if (cap) return { kind: "capture", content: cap };
   const text = clean(raw); const b = bare(text);
   let m: RegExpExecArray | null;
-  if ((m = /^(?:(?:ok(?:ay)?|now|and) )?(?:switch (?:over )?to|change to|jump to)\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "switch" };
+  if (/^(?:(?:ok(?:ay)?|so|please) )?(?:make|turn) (?:this|that|it)(?: conversation| chat)? (?:into )?an idea\b|^(?:save|add) (?:this|that) as an idea\b/.test(b)) return { kind: "make_idea" };
+  if ((m = /^(?:(?:ok(?:ay)?|now|and) )?(?:switch (?:over )?to|change to|jump to)\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "switch", strong: true };
   if ((m = /^(?:(?:ok(?:ay)?|so|now) )?(?:let'?s|let us|can we|i want to|i'd like to) (?:talk|chat|think) (?:about|through)\s+(.+)$/.exec(b))
-   || (m = /^(?:(?:ok(?:ay)?|so) )?(?:let'?s )?(?:open(?: up)?|(?:go )?back to|resume|pick up|continue(?: with)?)\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "open" };
+   || (m = /^(?:(?:ok(?:ay)?|so) )?(?:let'?s )?(?:go )?back to\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "open", strong: true };
+  // Bare "open X" / "resume X" only opens when X matches an idea above threshold; otherwise it is handled as a question.
+  if ((m = /^(?:(?:ok(?:ay)?|so) )?(?:let'?s )?(?:open(?: up)?|resume|pick up|continue(?: with)?)\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "open", strong: false };
   if ((m = /^(?:please )?(?:add|at|and|had|take|make|save) (?:a |this )?note(?: that)?\s*[:,\-–—]?\s*(.+)$/i.exec(text.trim()))) return { kind: "note", text: m[1]!.trim() };
   if (/^(?:please )?(?:make|turn) (?:this|it|that)(?: idea)? (?:into )?a skill\b|^(?:add|save) (?:this|it) as a skill\b|^deep dive (?:on )?(?:this|it)\b/.test(b)) return { kind: "skill" };
   if (/\b(?:what(?:'s| is| are) (?:its|the|it's|this idea's) (?:evaluation|scores?|rating)|how (?:did|does) it score|read (?:me )?(?:its|the) (?:evaluation|scores))\b/.test(b)) return { kind: "evaluation" };
@@ -59,36 +63,48 @@ export function decideMatch(ranked: Array<{ id: string; title: string; score: nu
 }
 export const QUERY_PREFIX = "Instruct: Given a spoken request, retrieve the matching idea\nQuery: ";
 
+const content = (s: string) => toks(s).filter(w => w.length > 3);
 // ---------- context ----------
 // Facts below this similarity to the question are left out, so weakly related findings are not cited as "your research".
 export const FACT_MIN_SIM = Number(process.env.VOICE_FACT_MIN_SIM ?? 0.45);
 export type Fact = { tag: string; text: string; source: "research" | "skill"; sim: number };
 export type IdeaContext = { title: string; content: string; evaluation: null | { feasibility: number; cost: number; relevance: number; novelty: number; summary: string }; facts: Fact[]; recent: Turn[]; summary: string | null };
-export function buildContext(ctx: IdeaContext, question: string) {
+export function buildContext(ctx: IdeaContext, question: string, mode: "voice" | "web" = "voice") {
   const e = ctx.evaluation;
   const lines = [`IDEA: ${ctx.title}`, `DESCRIPTION: ${ctx.content.slice(0, 700)}`];
   if (e) lines.push(`EVALUATION (1-5, cost 5 = cheapest): feasibility ${e.feasibility}, cost ${e.cost}, relevance ${e.relevance}, novelty ${e.novelty}. ${e.summary.slice(0, 300)}`);
   if (ctx.summary) lines.push(`EARLIER CONVERSATIONS: ${ctx.summary}`);
   if (ctx.facts.length) lines.push("VERIFIED FACTS FROM RICHARD'S RESEARCH:", ...ctx.facts.map(f => `[${f.tag}] ${f.text}`));
   if (ctx.recent.length) lines.push("RECENT CONVERSATION:", ...ctx.recent.map(t => `${t.role === "note" ? "NOTE" : t.role === "user" ? "Richard" : "Bailey"} (${t.channel}): ${t.text.slice(0, 300)}`));
-  const system = "You are Bailey, Richard's local voice assistant. You are exploring one of Richard's ideas with him. " +
-    "Answer in one to three short spoken sentences, plain text only. Use the context below. When you use a verified fact, put its tag such as [F1] right after it. " +
+  const system = "You are Bailey, Richard's local assistant. You are exploring one of Richard's ideas with him. " +
+    (mode === "voice" ? "Answer in one to three short spoken sentences, plain text only." : "This is a text chat: answer in up to three short paragraphs of plain text (no markdown, no tables).") + " Use the context below. When you use a verified fact, put its tag such as [F1] right after it. " +
     "Do not invent research results; if the context doesn't cover the question, say so briefly and give a short general answer.\n\n" + lines.join("\n");
   return { system, user: question, factTags: ctx.facts.map(f => f.tag) };
 }
-/** Strips [F#] tags, and says what the answer is based on when tags were used. */
-export function finishGrounded(raw: string, facts: Fact[]) {
-  const used = [...new Set([...raw.matchAll(/\[((?:F\d+(?:,\s*)?)+)\]/g)].flatMap(m => m[1]!.split(/,\s*/)))].filter(t => facts.some(f => f.tag === t));
+/** A cited fact counts as used only if the citing sentence actually shares content words with it. */
+export function citationUsed(sentence: string, fact: string, min = Number(process.env.VOICE_CITE_MIN_OVERLAP ?? 0.25)) {
+  const f = new Set(content(fact)); const w = [...new Set(content(sentence.replace(/\[[^\]]*\]/g, " ")))];
+  const shared = w.filter(x => f.has(x)).length;
+  return shared >= 2 && shared / Math.max(1, Math.min(w.length, f.size)) >= min;
+}
+/** Strips [F#] tags; says what the answer is based on only when a cited fact is verifiably used by its sentence. */
+export function finishGrounded(raw: string, facts: Fact[], opts: { cap?: boolean } = {}) {
+  const used: string[] = [];
+  for (const sent of raw.match(/[^.!?]+[.!?]*(?:\s*\[[^\]]*\])?/g) ?? []) {
+    for (const m of sent.matchAll(/\[((?:F\d+(?:,\s*)?)+)\]/g)) for (const tag of m[1]!.split(/,\s*/)) {
+      const f = facts.find(x => x.tag === tag);
+      if (f && !used.includes(tag) && citationUsed(sent, f.text)) used.push(tag);
+    }
+  }
   let text = raw.replace(/\s*\[(?:F\d+(?:,\s*)?)+\]/g, "").replace(/\s*\[[A-Z][A-Z0-9 ,_-]*\]/g, "") /* stray [IDEA]-style labels */.replace(/\s+([.,!?])/g, "$1").trim();
   if (used.length && !/\b(research|based on|according to|findings?|sources?)\b/i.test(text)) {
     const kinds = new Set(used.map(t => facts.find(f => f.tag === t)!.source));
     text = `${kinds.has("research") ? "From your research" : "From the skill write-up"}: ${text}`;
   }
-  return { text: capReply(text), used };
+  return { text: opts.cap === false ? text : capReply(text), used };
 }
 
 // ---------- summary grounding ----------
-const content = (s: string) => toks(s).filter(w => w.length > 3);
 /** Keeps only sentences whose content words mostly appear in the source (transcript + previous summary). */
 export function groundSummary(summary: string, source: string, minOverlap = 0.5) {
   const src = new Set(content(source)); const kept: string[] = [], dropped: string[] = [];
@@ -105,10 +121,20 @@ export type ExplorerDeps = {
   db: Database.Database; embed: (xs: string[]) => Promise<number[][]>; llm: LLM; model: string;
   captureIdea: (content: string) => Promise<{ id: string; title: string }>;
   createSkill: (ideaId: string) => Promise<{ status: number; body: any }>;
+  /** Existing POST /ideas logic (auto-queues expansion, evaluation, research). */
+  createIdea: (title: string, content: string) => Promise<{ id: string; title: string }>;
+  /** Topic skill (no parent idea of Richard's): POST /skills/topic logic. */
+  createTopicSkill: (topic: string, seed: string, sessionId: string | null) => Promise<{ status: number; body: any }>;
   generalAnswer: (q: string) => Promise<string>;
   now?: () => number; log?: (...a: unknown[]) => void; idleMs?: number;
 };
-type Pending = { kind: "confirm" | "choose"; candidates: Array<{ id: string; title: string }> };
+type Pending = { kind: "confirm" | "choose"; candidates: Array<{ id: string; title: string }> }
+  | { kind: "save_idea"; draft: IdeaDraft } | { kind: "save_skill"; proposal: SkillProposal };
+export type IdeaDraft = { title: string; content: string };
+export type SkillProposal = { mode: "idea" | "topic"; topic: string; seed: string; ideaId: string | null; ideaTitle: string | null; fit: number | null };
+export const SKILL_FIT = Number(process.env.SKILL_FIT_MIN_SIM ?? 0.6);
+const KEYWORD = /\b(make|turn) (this|that|it)\b.*\b(an idea|a skill)\b|\badd this as a skill\b/i;
+export function parseJsonObject(s: string): any { const m = /\{[\s\S]*\}/.exec(s); if (!m) return null; try { return JSON.parse(m[0]); } catch { return null; } }
 export type Reply = { reply: string; emotion: "neutral" | "happy" | "sad"; intent: string; sessionId?: string; ideaId?: string | null; timings?: Record<string, number> };
 
 export function createExplorer(d: ExplorerDeps) {
@@ -182,8 +208,95 @@ export function createExplorer(d: ExplorerDeps) {
   }
   function sweepIdle() { for (const s of store.idleSessions(idleMs)) { log("session idle timeout", s.id); endSession(s, "timeout"); } }
 
+  const speaker = (t: Turn) => t.role === "note" ? "NOTE" : t.role === "user" ? "Richard" : "Bailey";
+  const transcriptOf = (sessionId: string, max = 16) => store.turns(sessionId).filter(t => !(t.role === "user" && KEYWORD.test(t.text))).slice(-max);
+
+  /** gemma4 drafts an idea from the conversation; sentences not grounded in what was said are dropped. */
+  async function draftIdea(sessionId: string): Promise<IdeaDraft | null> {
+    const turns = transcriptOf(sessionId); if (!turns.some(t => t.role === "user" || t.role === "note")) return null;
+    const src = turns.map(t => `${speaker(t)}: ${t.text}`).join("\n");
+    const raw = await d.llm([{ role: "system", content: "Extract ONE new idea Richard is proposing in this conversation. Reply with JSON only: {\"title\": \"<at most 10 words>\", \"description\": \"<2 to 4 sentences>\"}. " +
+      "Use only what was said in the conversation; do not add features, numbers or claims that were not mentioned." }, { role: "user", content: src }], { numPredict: 250, temperature: 0.2 });
+    const j = parseJsonObject(raw); const title = String(j?.title ?? "").replace(/\s+/g, " ").trim().replace(/[.]+$/, "").slice(0, 120);
+    const g = groundSummary(String(j?.description ?? "").replace(/\s+/g, " ").trim(), src, 0.5);
+    if (g.dropped.length) log("idea draft dropped ungrounded", JSON.stringify(g.dropped));
+    if (!title || !g.text) return null;
+    return { title, content: g.text };
+  }
+
+  /** Extracts the topic; uses the active idea when the topic fits it (embedding similarity), else a topic skill. */
+  async function proposeSkill(sessionId: string): Promise<SkillProposal | null> {
+    const s = store.getSession(sessionId); if (!s) return null;
+    const turns = transcriptOf(sessionId);
+    const ideaRow = s.idea_id ? d.db.prepare(`SELECT id, title, content FROM ideas WHERE id = ?`).get(s.idea_id) as { id: string; title: string; content: string } : undefined;
+    if (!turns.some(t => t.role === "user" || t.role === "note")) {
+      return ideaRow ? { mode: "idea", topic: ideaRow.title, seed: ideaRow.content, ideaId: ideaRow.id, ideaTitle: ideaRow.title, fit: 1 } : null;
+    }
+    const src = turns.map(t => `${speaker(t)}: ${t.text}`).join("\n");
+    const raw = await d.llm([{ role: "system", content: "What topic should a deep-dive research write-up cover, based on this conversation? Reply with JSON only: {\"topic\": \"<3 to 8 word topic title>\", \"seed\": \"<2 to 3 sentences describing what to research, using only what was said>\"}." },
+      { role: "user", content: (ideaRow ? `ACTIVE IDEA: ${ideaRow.title}\n` : "") + src }], { numPredict: 200, temperature: 0.2 });
+    const j = parseJsonObject(raw); const topic = String(j?.topic ?? "").replace(/\s+/g, " ").trim().replace(/[.]+$/, "").slice(0, 120);
+    const seed = groundSummary(String(j?.seed ?? "").replace(/\s+/g, " ").trim(), (ideaRow ? `${ideaRow.title} ${ideaRow.content} ` : "") + src, 0.5).text || topic;
+    if (!topic) return null;
+    let fit: number | null = null;
+    if (ideaRow) {
+      const iv = loadIdeaVectors(d.db).get(ideaRow.id); const [tv] = await d.embed([`${topic}\n${seed}`]);
+      fit = iv ? Number(cosine(tv!, iv).toFixed(3)) : null;
+    }
+    const useIdea = !!ideaRow && fit !== null && fit >= SKILL_FIT;
+    return { mode: useIdea ? "idea" : "topic", topic, seed, ideaId: useIdea ? ideaRow!.id : null, ideaTitle: useIdea ? ideaRow!.title : null, fit };
+  }
+
+  /** Confirmed idea draft -> existing POST /ideas logic; links the session (and attaches it if it had no idea). */
+  async function confirmIdea(sessionId: string, draft: IdeaDraft) {
+    const r = await d.createIdea(draft.title.slice(0, 200), draft.content.slice(0, 10000));
+    store.link(sessionId, "created_idea", r.id);
+    return r;
+  }
+  async function confirmSkill(sessionId: string, p: SkillProposal) {
+    const r = p.mode === "idea" && p.ideaId ? await d.createSkill(p.ideaId) : await d.createTopicSkill(p.topic, p.seed, sessionId);
+    const skillId = r.body?.skillId as string | undefined;
+    if (r.status === 202 && skillId) store.link(sessionId, p.mode === "idea" ? "queued_skill" : "created_topic_skill", skillId);
+    return r;
+  }
+  const skillReply = (r: { status: number; body: any }, p: SkillProposal) => r.status === 202 ? `Okay, I queued a deep dive on ${p.mode === "idea" ? p.ideaTitle : p.topic}. It takes about five minutes.`
+    : r.status === 409 ? (r.body?.activeJobId ? "A deep dive on that is already running." : "That's already a skill. You can refresh it from the dashboard.") : "Sorry, I couldn't queue the deep dive.";
+
+  /** Web chat turn. Keyword actions return a draft for the UI to confirm; nothing is created here. */
+  async function webMessage(sessionId: string, text: string): Promise<{ reply: string; action?: { type: "idea_draft"; draft: IdeaDraft } | { type: "skill_draft"; proposal: SkillProposal }; used?: string[]; timings: Record<string, number> }> {
+    const t0 = now(); const timings: Record<string, number> = {};
+    const s = store.getSession(sessionId)!; const intent = parseIntent(text);
+    store.addTurn(sessionId, "user", text, "web");
+    const done = (reply: string, extra: object = {}) => { store.addTurn(sessionId, "assistant", reply, "web"); timings.total = now() - t0; return { reply, timings, ...extra }; };
+    if (intent.kind === "make_idea") {
+      const dft = await draftIdea(sessionId);
+      return dft ? done(`Here's a draft idea. Edit it if you like, then confirm.\n\n${dft.title}\n${dft.content}`, { action: { type: "idea_draft", draft: dft } })
+        : done("There isn't enough in this conversation yet to turn into an idea.");
+    }
+    if (intent.kind === "skill") {
+      const p = await proposeSkill(sessionId);
+      return p ? done(p.mode === "idea" ? `I can start a deep dive on this idea: ${p.ideaTitle}. Confirm to queue it.` : `I can start a deep dive on the topic "${p.topic}". Confirm to queue it.`, { action: { type: "skill_draft", proposal: p } })
+        : done("There isn't enough in this conversation yet to pick a topic.");
+    }
+    if (s.idea_id) {
+      const t1 = now(); const ctx = await loadContext(s.idea_id, text, 6); timings.context = now() - t1;
+      const p = buildContext(ctx, text, "web"); const t2 = now();
+      const raw = await d.llm([{ role: "system", content: p.system }, { role: "user", content: p.user }], { numPredict: 450, temperature: 0.3 });
+      timings.llm = now() - t2;
+      const g = finishGrounded(stripReasoning(raw) || raw, ctx.facts, { cap: false });
+      return done(g.text.slice(0, 2500) || "Sorry, I don't have an answer for that.", { used: g.used });
+    }
+    const hist = store.turns(sessionId).slice(-12, -1).filter(t => t.role !== "note").map(t => ({ role: t.role as "user" | "assistant", content: t.text }));
+    const t2 = now();
+    const raw = await d.llm([{ role: "system", content: "You are Bailey, Richard's local assistant, in a text chat. Answer helpfully in plain text, at most three short paragraphs, no markdown. If you don't know, say so." }, ...hist, { role: "user", content: text }], { numPredict: 450, temperature: 0.4 });
+    timings.llm = now() - t2;
+    return done((stripReasoning(raw) || raw).replace(/[*#`]+/g, "").trim().slice(0, 2500));
+  }
+  function closeSession(sessionId: string, reason = "user") { const s = store.getSession(sessionId); if (s && !s.ended_at) { endSession(s, reason); return true; } return false; }
+
   async function activate(deviceId: string, sess: Session | undefined, ideaId: string): Promise<Session> {
-    if (sess && sess.idea_id && sess.idea_id !== ideaId) { endSession(sess, "switch"); sess = undefined; }
+    // A session about another idea, or an idea-less one that already has turns (general Q&A), is closed; the idea gets a fresh session.
+    if (sess && (sess.idea_id ? sess.idea_id !== ideaId : store.turns(sess.id).length > 0)) { endSession(sess, "switch"); sess = undefined; }
     if (!sess) sess = store.startSession({ channel: "voice", deviceId, ideaId });
     else { store.setIdea(sess.id, ideaId); store.setState(sess.id, null); }
     return store.getSession(sess.id)!;
@@ -193,7 +306,7 @@ export function createExplorer(d: ExplorerDeps) {
     const t0 = now(); const timings: Record<string, number> = {};
     let sess = store.activeForDevice(deviceId);
     if (sess && now() - sess.last_activity_at > idleMs) { endSession(sess, "timeout"); sess = undefined; }
-    const intent = parseIntent(text);
+    let intent = parseIntent(text);
     const pending: Pending | null = sess?.state ? JSON.parse(sess.state).pending ?? null : null;
     // Navigation turns (open/confirm/recap/close) are not stored: history keeps only the substance of the conversation.
     const NAV = new Set(["open", "confirm", "choose", "recap", "close"]);
@@ -207,7 +320,19 @@ export function createExplorer(d: ExplorerDeps) {
       catch (e) { log("capture failed", e); return record(sess, { reply: "Sorry, I couldn't save that idea.", emotion: "sad", intent: "capture" }); }
     }
 
-    if (pending && sess) {
+    if (pending && sess && (pending.kind === "save_idea" || pending.kind === "save_skill")) {
+      if (intent.kind === "yes") {
+        store.setState(sess.id, null);
+        if (pending.kind === "save_idea") {
+          try { const r = await confirmIdea(sess.id, pending.draft); return record(sess, { reply: capReply(`Saved. ${r.title} is in your idea queue.`), emotion: "happy", intent: "make_idea" }); }
+          catch (e) { log("make idea failed", e); return record(sess, { reply: "Sorry, I couldn't save that idea.", emotion: "sad", intent: "make_idea" }); }
+        }
+        const r = await confirmSkill(sess.id, pending.proposal).catch(e => ({ status: 0, body: { error: String(e) } }));
+        return record(sess, { reply: capReply(skillReply(r, pending.proposal)), emotion: r.status === 202 ? "happy" : "neutral", intent: "skill" });
+      }
+      if (intent.kind === "no") { store.setState(sess.id, null); return record(sess, { reply: "Okay, I won't save it.", emotion: "neutral", intent: pending.kind === "save_idea" ? "make_idea" : "skill" }); }
+      store.setState(sess.id, null); // anything else cancels the question
+    } else if (pending && sess && (pending.kind === "confirm" || pending.kind === "choose")) {
       let chosen: { id: string; title: string } | undefined;
       if (intent.kind === "yes" && pending.kind === "confirm") chosen = pending.candidates[0];
       else if (intent.kind === "pick") chosen = pending.candidates[intent.index];
@@ -225,10 +350,15 @@ export function createExplorer(d: ExplorerDeps) {
       store.setState(sess.id, null); // anything else cancels the pending question and is handled normally
     }
 
+    let opened: Awaited<ReturnType<typeof match>> | null = null;
     if (intent.kind === "open") {
-      const t1 = now(); const m = await match(intent.query); timings.match = now() - t1;
+      const t1 = now(); const m = opened = await match(intent.query); timings.match = now() - t1;
       log("match", JSON.stringify({ q: intent.query, kind: m.kind, top: m.ranked.slice(0, 3).map(r => [r.title, r.score]) }));
-      if (m.kind === "none") return record(sess, { reply: "I couldn't find an idea like that. Try saying part of its title.", emotion: "neutral", intent: "open" });
+      if (m.kind === "none" && intent.strong) return record(sess, { reply: "I couldn't find an idea like that. Try saying part of its title.", emotion: "neutral", intent: "open" });
+      if (m.kind === "none") intent = { kind: "question", text: clean(text) }; // bare "open X" with no match: a question
+    }
+    if (intent.kind === "open") {
+      const m = opened!;
       const pend: Pending = m.kind === "confident" ? { kind: "confirm", candidates: m.top } : { kind: "choose", candidates: m.top };
       if (!sess) sess = store.startSession({ channel: "voice", deviceId, state: { pending: pend } }); else store.setState(sess.id, { pending: pend });
       const reply = m.kind === "confident" ? capReply(`${m.top[0]!.title}?`) : m.top.length > 1 ? capReply(`Did you mean ${m.top[0]!.title}, or ${m.top[1]!.title}?`) : capReply(`Did you mean ${m.top[0]!.title}?`);
@@ -243,11 +373,29 @@ export function createExplorer(d: ExplorerDeps) {
       const r = record(sess, { reply: title ? capReply(`Okay, closing ${title}. I'll remember where we left off.`) : "Okay.", emotion: "neutral", intent: "close" });
       endSession(store.getSession(sess.id)!, "user"); return r;
     }
+    if (intent.kind === "make_idea" || intent.kind === "skill") {
+      if (!sess) return { reply: "There's nothing to save yet. Tell me about it first.", emotion: "neutral", intent: intent.kind, timings };
+      store.addTurn(sess.id, "user", text, "voice");
+      if (intent.kind === "make_idea") {
+        const dft = await draftIdea(sess.id);
+        if (!dft) { const reply = "There isn't enough in our conversation yet to make an idea."; store.addTurn(sess.id, "assistant", reply, "voice"); return { reply, emotion: "neutral", intent: "make_idea", sessionId: sess.id, timings }; }
+        store.setState(sess.id, { pending: { kind: "save_idea", draft: dft } });
+        const reply = capReply(`The idea is: ${dft.title}. Save it?`); store.addTurn(sess.id, "assistant", reply, "voice");
+        timings.total = now() - t0; return { reply, emotion: "neutral", intent: "make_idea", sessionId: sess.id, ideaId: sess.idea_id, timings };
+      }
+      const p = await proposeSkill(sess.id);
+      if (!p) { const reply = "There isn't enough in our conversation yet to pick a topic."; store.addTurn(sess.id, "assistant", reply, "voice"); return { reply, emotion: "neutral", intent: "skill", sessionId: sess.id, timings }; }
+      store.setState(sess.id, { pending: { kind: "save_skill", proposal: p } });
+      const reply = capReply(p.mode === "idea" ? `Start a deep dive on ${p.ideaTitle}?` : `Start a deep dive on the topic ${p.topic}?`); store.addTurn(sess.id, "assistant", reply, "voice");
+      timings.total = now() - t0; return { reply, emotion: "neutral", intent: "skill", sessionId: sess.id, ideaId: sess.idea_id, timings };
+    }
     if (!active) {
-      if (intent.kind === "note" || intent.kind === "skill" || intent.kind === "evaluation")
+      if (intent.kind === "note" || intent.kind === "evaluation")
         return { reply: "Open an idea first. For example, say: let's talk about the habit tracker.", emotion: "neutral", intent: intent.kind, timings };
-      const t1 = now(); const reply = await d.generalAnswer(text); timings.llm = now() - t1; timings.total = now() - t0;
-      return { reply, emotion: "neutral", intent: "general", timings };
+      const t1 = now(); const reply = await d.generalAnswer(text); timings.llm = now() - t1;
+      // General questions are kept in an idea-less voice session so "make this an idea" can use them.
+      if (!sess) sess = store.startSession({ channel: "voice", deviceId });
+      return record(sess, { reply, emotion: "neutral", intent: "general" });
     }
     const ideaId = active.idea_id!;
     if (intent.kind === "note") {
@@ -259,13 +407,6 @@ export function createExplorer(d: ExplorerDeps) {
       const reply = e ? capReply(`Feasibility ${e.feasibility}, cost ${e.cost}, relevance ${e.relevance}, novelty ${e.novelty}, out of five. ${(e.summary.match(/[^.!?]+[.!?]/) ?? [""])[0]}`)
         : "It hasn't been evaluated yet.";
       return record(active, { reply, emotion: "neutral", intent: "evaluation" });
-    }
-    if (intent.kind === "skill") {
-      const r = await d.createSkill(ideaId).catch(e => ({ status: 0, body: { error: String(e) } }));
-      const reply = r.status === 202 ? "Okay, I started a deep dive on it. It takes about five minutes, and then I can talk about it in more depth."
-        : r.status === 409 ? (r.body?.activeJobId ? "A deep dive on it is already running." : "It's already a skill. You can refresh it from the dashboard.")
-        : "Sorry, I couldn't start the deep dive.";
-      return record(active, { reply, emotion: r.status === 202 ? "happy" : "neutral", intent: "skill" });
     }
     if (intent.kind === "yes" || intent.kind === "no" || intent.kind === "pick") return record(active, { reply: "Okay.", emotion: "neutral", intent: intent.kind });
     // grounded question
@@ -279,6 +420,6 @@ export function createExplorer(d: ExplorerDeps) {
     return record(active, { reply: g.text || "Sorry, I don't have a short answer for that.", emotion: "neutral", intent: "grounded" });
   }
 
-  return { handle, sweepIdle, summarize, recap, match, loadContext, store, flush: () => Promise.all([...pendingSummaries]) };
+  return { handle, sweepIdle, summarize, recap, match, loadContext, store, draftIdea, proposeSkill, confirmIdea, confirmSkill, webMessage, closeSession, flush: () => Promise.all([...pendingSummaries]) };
 }
 export type Explorer = ReturnType<typeof createExplorer>;

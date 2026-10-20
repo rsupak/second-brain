@@ -109,7 +109,7 @@ async function ideas() {
   const [ir, er] = await Promise.all([api("/ideas"), api("/evaluations")]);
   if (!ir.ok) return render(el("h2", {}, "Ideas"), errorBox(`GET /ideas failed (${ir.status})`));
   const evals = new Map((er.ok ? er.body : []).map(e => [e.idea_id, e]));
-  const rows = ir.body.map(i => ({ ...i, ev: evals.get(i.id) || null }));
+  const rows = ir.body.filter(i => i.origin !== "topic").map(i => ({ ...i, ev: evals.get(i.id) || null })); // topic-skill anchors live under Skills
   const val = (r, k) => k === "title" ? r.title.toLowerCase() : k === "depth" ? r.depth : k === "score" ? score(r.ev) : r.ev ? r.ev[k] : null;
   const draw = () => {
     const { key, dir } = ideaSort;
@@ -161,6 +161,7 @@ async function ideaDetail(id) {
     el("h2", {}, idea ? idea.title : id),
     el("div", { class: "card" }, el("div", {}, idea?.content ?? ""), el("div", { class: "muted small" }, `origin ${idea?.origin ?? "?"} · created ${fmtTime(idea?.created_at)}`)),
     skillCard(id),
+    chatPanel(id),
     conversationsPanel(id),
     el("h3", {}, "Evaluation"),
     ev ? el("div", { class: "card" },
@@ -212,6 +213,99 @@ function skillStatus(s, job) {
   const st = job && (job.status === "pending" || job.status === "running") ? job.status : s.status;
   return el("span", {}, pill(st === "ready" ? "completed" : st), st === "ready" ? "" : ` ${st}`, s.version ? el("span", { class: "muted small" }, ` · v${s.version}`) : null);
 }
+
+// ---------- web chat (shared conversation store, channel "web") ----------
+const JSON_POST = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) });
+// Chat about one idea, embedded on the idea page: continues the latest open web session for the idea, or starts one.
+function chatPanel(ideaId) {
+  const box = el("div", { class: "card chat-panel" }, el("strong", {}, "Chat about this idea"), el("div", { class: "muted small" }, "Loading…"));
+  api(`/chat/sessions?ideaId=${encodeURIComponent(ideaId)}&limit=1`).then(r => {
+    const open = r.ok ? r.body.sessions.find(s => !s.endedAt) : null;
+    const start = el("button", { onclick: async () => {
+      start.disabled = true;
+      const c = await api("/chat/sessions", JSON_POST({ ideaId }));
+      if (c.status === 201) box.replaceChildren(el("strong", {}, "Chat about this idea"), chatView(c.body.session.id));
+      else { start.disabled = false; box.append(errorBox(`Could not start chat (HTTP ${c.status})`)); }
+    } }, "Start a chat");
+    box.replaceChildren(el("strong", {}, "Chat about this idea"), open ? chatView(open.id) : el("div", {}, el("p", { class: "muted small" }, "Chats here are shared with the AIPI: it recaps them when you open this idea by voice."), start));
+  });
+  return box;
+}
+// One chat session: transcript, input, close, attach-to-idea (general chats), and keyword action cards.
+function chatView(sessionId) {
+  const wrap = el("div", { class: "chat" }); let sid = sessionId;
+  const log = el("div", { class: "chat-log" }); const actions = el("div", {}); const status = el("div", { class: "small muted" });
+  const input = el("textarea", { class: "wide", rows: 3, placeholder: "Message… (try “make this an idea” or “add this as a skill”)" });
+  const who = { user: "You", assistant: "Bailey", note: "Note" };
+  const msgNode = m => el("div", { class: `chat-msg ${m.role}` }, el("span", { class: `channel ${m.channel}` }, m.channel), " ", el("strong", {}, `${who[m.role] || m.role}: `), el("span", { class: "prose" }, m.text));
+  const head = el("div", { class: "small muted" });
+  const linkTo = (kind, targetId) => api(`/chat/sessions/${encodeURIComponent(sid)}/links`, JSON_POST({ kind, targetId }));
+  function ideaDraftCard(draft) {
+    const t = el("input", { class: "wide", value: draft.title, maxlength: 200 }); const c = el("textarea", { class: "wide", rows: 4 }); c.value = draft.content;
+    const note = el("div", {}); const ok = el("button", { onclick: async () => {
+      ok.disabled = true;
+      const r = await api("/ideas", JSON_POST({ title: t.value.trim(), content: c.value.trim() }));
+      if (r.status === 201) { await linkTo("created_idea", r.body.idea.id); card.replaceChildren(el("div", { class: "notice ok" }, "Idea added to the queue: ", el("a", { href: `#/idea/${encodeURIComponent(r.body.idea.id)}` }, r.body.idea.title))); refresh(); }
+      else { ok.disabled = false; note.replaceChildren(errorBox(`Could not add idea (HTTP ${r.status})`)); }
+    } }, "Confirm");
+    const card = el("div", { class: "card draft" }, el("strong", {}, "Draft idea"), el("div", { class: "muted small" }, "Drafted from this conversation only. Edit, then confirm to add it (it will be expanded, evaluated and researched)."), t, c,
+      el("div", {}, ok, " ", el("button", { class: "secondary", onclick: () => card.remove() }, "Cancel")), note);
+    return card;
+  }
+  function skillDraftCard(p) {
+    const note = el("div", {}); const ok = el("button", { onclick: async () => {
+      ok.disabled = true;
+      const r = p.mode === "idea" ? await api(`/ideas/${encodeURIComponent(p.ideaId)}/skill`, JSON_POST({})) : await api("/skills/topic", JSON_POST({ topic: p.topic, seed: p.seed, sessionId: sid }));
+      if (r.status === 202) { if (p.mode === "idea") await linkTo("queued_skill", r.body.skillId); card.replaceChildren(el("div", { class: "notice ok" }, "Deep dive queued: ", el("a", { href: `#/skill/${encodeURIComponent(r.body.skillId)}` }, p.mode === "idea" ? p.ideaTitle : p.topic))); }
+      else if (r.status === 409) card.replaceChildren(el("div", { class: "notice warn" }, r.body?.activeJobId ? "A deep dive is already running for that." : "That's already a skill.", r.body?.skillId ? [" ", el("a", { href: `#/skill/${encodeURIComponent(r.body.skillId)}` }, "Open it")] : null));
+      else { ok.disabled = false; note.replaceChildren(errorBox(`Could not queue the deep dive (HTTP ${r.status})`)); }
+    } }, "Confirm");
+    const card = el("div", { class: "card draft" }, el("strong", {}, p.mode === "idea" ? `Deep dive on this idea: ${p.ideaTitle}` : `New topic skill: ${p.topic}`),
+      p.mode === "topic" ? el("div", { class: "small" }, "Seed: ", p.seed) : null,
+      el("div", { class: "muted small" }, p.mode === "idea" ? "Uses the existing “Make this a skill” deep dive." : `Not tied to an idea${p.fit != null ? ` (fit with the open idea ${p.fit} < threshold)` : ""}.`),
+      el("div", {}, ok, " ", el("button", { class: "secondary", onclick: () => card.remove() }, "Cancel")), note);
+    return card;
+  }
+  async function refresh() {
+    const r = await api(`/chat/sessions/${encodeURIComponent(sid)}`);
+    if (!r.ok) { wrap.replaceChildren(errorBox(`Chat unavailable (HTTP ${r.status})`)); return; }
+    const s = r.body.session;
+    log.replaceChildren(...(r.body.messages.length ? r.body.messages.map(msgNode) : [el("p", { class: "muted small" }, "No messages yet.")]));
+    head.replaceChildren(s.ideaId ? ["About ", el("a", { href: `#/idea/${encodeURIComponent(s.ideaId)}` }, "this idea")] : "General chat (not tied to an idea)", ` · started ${fmtTime(s.startedAt)}`, s.endedAt ? ` · closed (${s.endReason})` : "");
+    if (!s.ideaId && !attachBox.childNodes.length) {
+      const ir = await api("/ideas"); const sel = el("select", {}, el("option", { value: "" }, "Attach to idea…"), ...(ir.ok ? ir.body.filter(i => i.origin !== "topic").map(i => el("option", { value: i.id }, i.title)) : []));
+      attachBox.replaceChildren(sel, " ", el("button", { class: "secondary", onclick: async () => { if (!sel.value) return; const a = await api(`/chat/sessions/${encodeURIComponent(sid)}/attach`, JSON_POST({ ideaId: sel.value })); if (a.ok) { attachBox.replaceChildren(); refresh(); } else status.textContent = `Attach failed (HTTP ${a.status})`; } }, "Attach"));
+    } else if (s.ideaId) attachBox.replaceChildren();
+  }
+  const attachBox = el("span", {});
+  const send = el("button", { onclick: async () => {
+    const text = input.value.trim(); if (!text) return;
+    send.disabled = true; status.textContent = "Bailey is thinking…"; log.append(msgNode({ role: "user", channel: "web", text }));
+    const r = await api(`/chat/sessions/${encodeURIComponent(sid)}/messages`, JSON_POST({ text }));
+    send.disabled = false; status.textContent = "";
+    if (!r.ok) { status.textContent = `Send failed (HTTP ${r.status})`; return; }
+    input.value = "";
+    if (r.body.continuedFrom) { sid = r.body.sessionId; status.textContent = "The previous chat was closed, so this continues in a new session."; }
+    await refresh();
+    if (r.body.action?.type === "idea_draft") actions.append(ideaDraftCard(r.body.action.draft));
+    if (r.body.action?.type === "skill_draft") actions.append(skillDraftCard(r.body.action.proposal));
+  } }, "Send");
+  const close = el("button", { class: "secondary", onclick: async () => { const r = await api(`/chat/sessions/${encodeURIComponent(sid)}/close`, JSON_POST({})); status.textContent = r.ok ? (r.body.summaryQueued ? "Closed. A summary is being written for the AIPI recap." : "Closed.") : `Close failed (HTTP ${r.status})`; refresh(); } }, "Close chat");
+  wrap.append(head, log, actions, input, el("div", {}, send, " ", close, " ", attachBox), status);
+  refresh();
+  return wrap;
+}
+// #/chat: general chats (and every web chat), newest first. #/chat/<id>: one chat.
+async function chatList() {
+  const r = await api("/chat/sessions?limit=100");
+  const start = el("button", { onclick: async () => { const c = await api("/chat/sessions", JSON_POST({})); if (c.status === 201) location.hash = `#/chat/${encodeURIComponent(c.body.session.id)}`; } }, "New general chat");
+  render(el("h2", {}, "Chat"), el("p", {}, start),
+    !r.ok ? errorBox(`GET /chat/sessions failed (${r.status})`) : r.body.sessions.length ? el("table", {}, el("tr", {}, el("th", {}, "chat"), el("th", {}, "idea"), el("th", {}, "messages"), el("th", {}, "last activity"), el("th", {}, "state")),
+      r.body.sessions.map(s => el("tr", {}, el("td", {}, el("a", { href: `#/chat/${encodeURIComponent(s.id)}` }, fmtTime(s.startedAt))), el("td", {}, s.ideaId ? el("a", { href: `#/idea/${encodeURIComponent(s.ideaId)}` }, "idea") : el("span", { class: "muted" }, "general")),
+        el("td", {}, s.messageCount), el("td", {}, fmtTime(s.lastActivityAt)), el("td", {}, s.endedAt ? pill("completed") : pill("running")))))
+      : el("p", { class: "muted" }, "No web chats yet."));
+}
+async function chatPage(id) { render(el("p", {}, el("a", { href: "#/chat" }, "← Chat")), el("h2", {}, "Chat"), el("div", { class: "card" }, chatView(id))); }
 
 // Conversations panel on the idea page: history across channels (voice / web) plus the rolling summary. Read-only.
 function conversationsPanel(ideaId) {
@@ -389,11 +483,13 @@ async function route() {
   if (location.hash !== "#/ideas") lastAddNotice = null;
   const h = location.hash || "#/";
   document.querySelectorAll("nav a").forEach(a => a.classList.toggle("active",
-    a.getAttribute("href") === h || (h.startsWith("#/idea/") && a.getAttribute("href") === "#/ideas") || (h.startsWith("#/skill/") && a.getAttribute("href") === "#/skills")));
+    a.getAttribute("href") === h || (h.startsWith("#/idea/") && a.getAttribute("href") === "#/ideas") || (h.startsWith("#/skill/") && a.getAttribute("href") === "#/skills") || (h.startsWith("#/chat/") && a.getAttribute("href") === "#/chat")));
   try {
     if (h.startsWith("#/idea/")) await ideaDetail(decodeURIComponent(h.slice(7)));
     else if (h.startsWith("#/skill/")) { const [sid, ver] = decodeURIComponent(h.slice(8)).split("@"); await skillDetail(sid, ver); }
     else if (h === "#/skills") await skills();
+    else if (h === "#/chat") await chatList();
+    else if (h.startsWith("#/chat/")) await chatPage(decodeURIComponent(h.slice(7)));
     else if (h === "#/ideas") await ideas();
     else if (h === "#/jobs") await jobs();
     else await overview();

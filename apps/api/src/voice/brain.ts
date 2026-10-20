@@ -1,6 +1,6 @@
 import { stripReasoning, capReply } from "./filters.js";
 // Routes a transcript to the Second Brain: idea capture via POST /ideas, otherwise a short answer.
-const CAPTURE_RE = /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:(?:bailey|baily|bailie|bailee|bayley|baylee|bailey's)[\s,.!]+)?(?:please[\s,]+)?(?:new idea|(?:capture|save|add|record) (?:an |a |a new |new )?idea)\b[\s:,.\-–—]*/i;
+const CAPTURE_RE = /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:(?:bailey|baily|bailie|bailee|bayley|baylee|bailey's)[\s,.!]+)?(?:please[\s,]+)?(?:new idea|(?:capture|save|add|record) (?:an |a |a new |new |and (?:a )?new |and you )?idea)\b[\s:,.\-–—]*/i;
 
 export function parseCapture(text: string): string | null {
   const m = CAPTURE_RE.exec(text);
@@ -32,6 +32,18 @@ export async function captureIdea(content: string): Promise<{ id: string; title:
 export async function createSkill(ideaId: string): Promise<{ status: number; body: any }> {
   const api = process.env.VOICE_API_URL ?? "http://127.0.0.1:3333";
   const res = await fetch(`${api}/ideas/${encodeURIComponent(ideaId)}/skill`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+export async function postIdea(title: string, content: string): Promise<{ id: string; title: string }> {
+  const api = process.env.VOICE_API_URL ?? "http://127.0.0.1:3333";
+  const res = await fetch(api + "/ideas", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title, content }) });
+  if (res.status !== 201) throw new Error(`POST /ideas -> HTTP ${res.status}`);
+  const body = await res.json() as any; return { id: String(body?.idea?.id ?? ""), title: String(body?.idea?.title ?? title) };
+}
+export async function createTopicSkill(topic: string, seed: string, sessionId: string | null): Promise<{ status: number; body: any }> {
+  const api = process.env.VOICE_API_URL ?? "http://127.0.0.1:3333";
+  const res = await fetch(api + "/skills/topic", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ topic, seed, sessionId }) });
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 

@@ -45,3 +45,6 @@ section.topic h3 { text-transform: capitalize; }
 .conv-msg { padding: 4px 0 4px 8px; border-left: 2px solid var(--line); margin: 4px 0; } .conv-msg.note { border-left-color: var(--warn); background: #fffbeb; }
 .channel { display: inline-block; font-size: 11px; padding: 0 7px; border-radius: 8px; background: #eef1f5; color: var(--muted); }
 .channel.voice { background: #e0f2fe; color: #075985; } .channel.web { background: #ecfccb; color: #3f6212; }
+.chat-log { max-height: 420px; overflow-y: auto; margin: 8px 0; } .chat-msg { padding: 6px 0 6px 8px; border-left: 2px solid var(--line); margin: 4px 0; }
+.chat-msg.assistant { border-left-color: var(--accent); } .card.draft { border-color: var(--accent); background: #f7faff; }
+button.secondary { background: #fff; color: var(--accent); }
