@@ -161,6 +161,7 @@ async function ideaDetail(id) {
     el("h2", {}, idea ? idea.title : id),
     el("div", { class: "card" }, el("div", {}, idea?.content ?? ""), el("div", { class: "muted small" }, `origin ${idea?.origin ?? "?"} · created ${fmtTime(idea?.created_at)}`)),
     skillCard(id),
+    conversationsPanel(id),
     el("h3", {}, "Evaluation"),
     ev ? el("div", { class: "card" },
       el("div", { class: "scores" }, ...["feasibility", "cost", "relevance", "novelty"].map(k => el("span", {}, `${k}: `, el("strong", {}, ev[k]))), el("span", {}, "score: ", el("strong", {}, score(ev)))),
@@ -210,6 +211,27 @@ const SKILL_POLL_MS = 15000;
 function skillStatus(s, job) {
   const st = job && (job.status === "pending" || job.status === "running") ? job.status : s.status;
   return el("span", {}, pill(st === "ready" ? "completed" : st), st === "ready" ? "" : ` ${st}`, s.version ? el("span", { class: "muted small" }, ` · v${s.version}`) : null);
+}
+
+// Conversations panel on the idea page: history across channels (voice / web) plus the rolling summary. Read-only.
+function conversationsPanel(ideaId) {
+  const box = el("div", { class: "card conversations" }, el("span", { class: "muted" }, "Loading conversations…"));
+  api(`/ideas/${encodeURIComponent(ideaId)}/conversations`).then(r => {
+    if (!r.ok) { box.replaceChildren(el("span", { class: "muted" }, `Conversations unavailable (HTTP ${r.status})`)); return; }
+    const { summary, sessions } = r.body;
+    const who = { user: "You", assistant: "Bailey", note: "Note" };
+    box.replaceChildren(
+      el("strong", {}, `Conversations (${sessions.length})`),
+      summary ? el("div", { class: "conv-summary" }, el("span", { class: "kind synthesis" }, "summary"), " ", summary.text,
+        el("div", { class: "muted small" }, `updated ${fmtTime(summary.updatedAt)} · ${summary.model}`)) : el("div", { class: "muted small" }, "No summary yet. One is written when a conversation ends."),
+      sessions.length ? sessions.map((s, i) => el("details", { class: "conv-session", open: i === 0 ? true : null },
+        el("summary", {}, el("span", { class: `channel ${s.channel}` }, s.channel), ` ${fmtTime(s.startedAt)} · ${s.messages.length} messages`,
+          s.endedAt ? el("span", { class: "muted small" }, ` · ended (${s.endReason || "closed"})`) : el("span", { class: "pill running" }, "open")),
+        s.messages.map(m => el("div", { class: `conv-msg ${m.role}` }, el("span", { class: `channel ${m.channel}` }, m.channel), " ",
+          el("strong", {}, `${who[m.role] || m.role}: `), m.text, el("span", { class: "muted small" }, ` ${fmtTime(m.createdAt)}`)))))
+        : el("div", { class: "muted" }, "No conversations yet. Say “let's talk about …” to the AIPI."));
+  }).catch(e => box.replaceChildren(el("span", { class: "muted" }, `Conversations unavailable: ${e && e.message ? e.message : e}`)));
+  return box;
 }
 
 // "Make this a skill" card on the idea page, with live status.

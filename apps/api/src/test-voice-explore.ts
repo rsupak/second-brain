@@ -19,6 +19,7 @@ const cases: Array<[string, string, any?]> = [
   ["Okay, switch to the air quality alerts.", "open", { query: "air quality alerts", verb: "switch" }],
   ["Yes.", "yes"], ["Yeah, that's it.", "yes"], ["No.", "no"], ["Neither of them.", "no"], ["The second one.", "pick", { index: 1 }], ["First.", "pick", { index: 0 }],
   ["Add a note: try a streak freeze after two missed days.", "note", { text: "try a streak freeze after two missed days." }],
+  ["At a note, try a streak freeze after two missed days.", "note", { text: "try a streak freeze after two missed days." }],
   ["Take a note that the battery should last a month", "note", { text: "the battery should last a month" }],
   ["Make this a skill.", "skill"], ["Add this as a skill", "skill"],
   ["What's its evaluation?", "evaluation"], ["What are the scores?", "evaluation"], ["How did it score?", "evaluation"],
@@ -42,6 +43,7 @@ for (const [text, kind, fields] of cases) {
   check("finishGrounded strips tags + says basis", g.text === "From your research: Streak freezes help keep users. Keep it simple." && g.used.join() === "F1,F2", g.text);
   const g2 = finishGrounded("I don't have research on that.", facts);
   check("finishGrounded leaves ungrounded answers alone", g2.text === "I don't have research on that." && g2.used.length === 0);
+  const g4 = finishGrounded("Get back on track [IDEA]. Then rest [EVALUATION].", facts); check("finishGrounded strips stray [IDEA] labels", g4.text === "Get back on track. Then rest.", g4.text);
   const g3 = finishGrounded("Fake tag [F9].", facts); check("finishGrounded ignores unknown tags", g3.used.length === 0 && g3.text === "Fake tag.", g3.text);
   const s = groundSummary("Richard discussed streak freezes for missed days. He decided on lunar mining robots.", "Richard: how do streak freezes work for missed days?");
   check("groundSummary keeps grounded, drops invented sentence", s.kept.length === 1 && s.dropped.length === 1, JSON.stringify(s));
@@ -97,7 +99,7 @@ for (const [q, title, want] of expect) {
 {
   const id = byTitle("Habit tracker with small next actions");
   const ctx = await ex.loadContext(id, "How should the app handle missed days?");
-  check("loadContext: evaluation + verified research facts ranked by similarity", !!ctx.evaluation && ctx.facts.length >= 1 && ctx.facts.every((f, i, a) => i === 0 || a[i - 1]!.sim >= f.sim) && ctx.facts[0]!.tag === "F1",
+  check("loadContext: evaluation + verified research facts ranked by similarity", !!ctx.evaluation && ctx.facts.length >= 1 && ctx.facts.every((f, i, a) => f.sim >= 0.45 && (i === 0 || a[i - 1]!.sim >= f.sim)) && ctx.facts[0]!.tag === "F1",
     `facts=${ctx.facts.length} top=${ctx.facts[0]?.sim.toFixed(3)} "${ctx.facts[0]?.text.slice(0, 70)}"`);
   const art = byTitle("Personalized Artwork Timeline Generator");
   const c2 = await ex.loadContext(art, "What data does the timeline need?");

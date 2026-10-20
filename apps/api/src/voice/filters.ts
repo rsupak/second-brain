@@ -18,7 +18,7 @@ export function filterTranscript(raw: string): { text: string | null; reason?: s
   const text = collapsed.replace(/\[[^\]]*\]|\([^)]*\)|\*[^*]*\*|♪+/g, " ").replace(/\s+/g, " ").trim();
   if (!/[a-z0-9]/i.test(text)) return { text: null, reason: "annotation-only" };
   const n = norm(text);
-  if (n.replace(/[^a-z0-9]/g, "").length < 3) return { text: null, reason: "too-short" };
+  if (n.replace(/[^a-z0-9]/g, "").length < 3 && n !== "no") return { text: null, reason: "too-short" }; // "no" answers a voice confirmation
   if (HALLUCINATIONS.has(n)) return { text: null, reason: "known-hallucination" };
   return { text };
 }

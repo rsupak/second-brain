@@ -112,6 +112,41 @@ async function main() {
     console.log(`LATENCY [${label}] speech=${r.speechMs}ms stt=${r.sttMs}ms brain=${r.brainMs}ms first_audio=${r.firstAudioMs}ms total(after stop -> tts stop)=${r.totalMs}ms`);
   }
 
+  // ---------- idea exploration (only against a test service on a DB copy: VOICE_SIM_EXPLORE_DB) ----------
+  const exploreDb = process.env.VOICE_SIM_EXPLORE_DB;
+  if (exploreDb) {
+    const { resolve } = await import("node:path");
+    if (resolve(exploreDb) === resolve("data/brain.sqlite")) throw new Error("VOICE_SIM_EXPLORE_DB must be a copy");
+    const transcript: string[] = [];
+    const turn = async (label: string, text: string) => {
+      const r = await utterance(ws, text);
+      const stt = r.msgs.find(m => m.type === "stt")?.text ?? "";
+      const said = r.msgs.filter(m => m.type === "tts" && m.state === "sentence_start").map(m => m.text).join(" ");
+      transcript.push(`Richard (stt): ${stt}`, `Bailey: ${said}`);
+      console.log(`LATENCY [explore:${label}] stt=${r.sttMs}ms brain=${r.brainMs}ms first_audio=${r.firstAudioMs}ms total=${r.totalMs}ms`);
+      return { ...r, stt, said };
+    };
+    const open = await turn("open", "Let's talk about the habit tracker.");
+    check("[explore] open -> confirm title aloud", open.said === "Habit tracker with small next actions?", open.said);
+    const yes = await turn("confirm", "Yes, that's it.");
+    check("[explore] confirm -> recap", /^Okay, Habit tracker with small next actions\./.test(yes.said) && yes.said.length <= 300, yes.said);
+    const q = await turn("question", "How should the app handle missed days?");
+    check("[explore] grounded question answered within caps", q.said.length > 0 && q.said.length <= 300 && !/\[F\d/.test(q.said) && !/the user (is|wants|asked)|i need to|<\/?think>/i.test(q.said), q.said);
+    const note = await turn("note", "Add a note: try a streak freeze after two missed days.");
+    check("[explore] note acknowledged", note.said === "Noted.", note.said);
+    const close = await turn("close", "Close.");
+    check("[explore] close acknowledged", /closing Habit tracker/.test(close.said), close.said);
+    const Database = (await import("better-sqlite3")).default; const db = new Database(exploreDb, { readonly: true });
+    let summary: string | undefined; const t0 = Date.now();
+    while (Date.now() - t0 < 120_000) { summary = db.prepare(`SELECT s.summary FROM idea_conversation_summaries s JOIN ideas i ON i.id = s.idea_id WHERE i.title LIKE 'Habit tracker%'`).pluck().get() as string | undefined; if (summary) break; await new Promise(r => setTimeout(r, 2000)); }
+    const sess = db.prepare(`SELECT * FROM conversation_sessions WHERE device_id = ? ORDER BY started_at DESC LIMIT 1`).get(DEVICE) as any;
+    const turns = sess ? db.prepare(`SELECT role, text, channel FROM conversation_turns WHERE session_id = ? ORDER BY created_at, rowid`).all(sess.id) as any[] : [];
+    check("[explore] session persisted: closed by user, user/assistant/note turns on voice channel", sess?.end_reason === "user" && turns.some(t => t.role === "note" && /streak freeze/i.test(t.text)) && turns.every(t => t.channel === "voice") && turns.filter(t => t.role === "user").length === 1, `${sess?.end_reason} ${turns.map(t => t.role).join(",")}`);
+    check("[explore] summary written after close", !!summary, `${Date.now() - t0}ms: ${summary}`);
+    db.close();
+    console.log("TRANSCRIPT\n  " + transcript.join("\n  ") + `\n  [summary] ${summary}`);
+  }
+
   // ---------- noise: must be ignored without speaking ----------
   const quiet = Buffer.alloc(16000 * 2 * 1.5); for (let i = 0; i < quiet.length / 2; i++) quiet.writeInt16LE(Math.round((Math.random() - 0.5) * 200), i * 2);
   for (const [label, input] of [["low-energy noise", quiet], ["whisper hallucination 'Thank you.'", "Thank you."]] as const) {

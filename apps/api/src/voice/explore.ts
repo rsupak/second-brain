@@ -27,7 +27,7 @@ export function parseIntent(raw: string): Intent {
   if ((m = /^(?:(?:ok(?:ay)?|now|and) )?(?:switch (?:over )?to|change to|jump to)\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "switch" };
   if ((m = /^(?:(?:ok(?:ay)?|so|now) )?(?:let'?s|let us|can we|i want to|i'd like to) (?:talk|chat|think) (?:about|through)\s+(.+)$/.exec(b))
    || (m = /^(?:(?:ok(?:ay)?|so) )?(?:let'?s )?(?:open(?: up)?|(?:go )?back to|resume|pick up|continue(?: with)?)\s+(.+)$/.exec(b))) return { kind: "open", query: strip(m[1]!), verb: "open" };
-  if ((m = /^(?:please )?(?:add|take|make|save) (?:a |this )?note(?: that)?\s*[:,\-–—]?\s*(.+)$/i.exec(text.trim()))) return { kind: "note", text: m[1]!.trim() };
+  if ((m = /^(?:please )?(?:add|at|and|had|take|make|save) (?:a |this )?note(?: that)?\s*[:,\-–—]?\s*(.+)$/i.exec(text.trim()))) return { kind: "note", text: m[1]!.trim() };
   if (/^(?:please )?(?:make|turn) (?:this|it|that)(?: idea)? (?:into )?a skill\b|^(?:add|save) (?:this|it) as a skill\b|^deep dive (?:on )?(?:this|it)\b/.test(b)) return { kind: "skill" };
   if (/\b(?:what(?:'s| is| are) (?:its|the|it's|this idea's) (?:evaluation|scores?|rating)|how (?:did|does) it score|read (?:me )?(?:its|the) (?:evaluation|scores))\b/.test(b)) return { kind: "evaluation" };
   if (/^(?:(?:ok(?:ay)?|alright) )?(?:close(?: (?:it|this|the idea|the session))?|(?:i'm |we're |i am |we are )?done(?: for now)?|that's all(?: for now)?|end (?:the )?session|stop exploring|goodbye|bye)$/.test(b)) return { kind: "close" };
@@ -60,6 +60,8 @@ export function decideMatch(ranked: Array<{ id: string; title: string; score: nu
 export const QUERY_PREFIX = "Instruct: Given a spoken request, retrieve the matching idea\nQuery: ";
 
 // ---------- context ----------
+// Facts below this similarity to the question are left out, so weakly related findings are not cited as "your research".
+export const FACT_MIN_SIM = Number(process.env.VOICE_FACT_MIN_SIM ?? 0.45);
 export type Fact = { tag: string; text: string; source: "research" | "skill"; sim: number };
 export type IdeaContext = { title: string; content: string; evaluation: null | { feasibility: number; cost: number; relevance: number; novelty: number; summary: string }; facts: Fact[]; recent: Turn[]; summary: string | null };
 export function buildContext(ctx: IdeaContext, question: string) {
@@ -77,7 +79,7 @@ export function buildContext(ctx: IdeaContext, question: string) {
 /** Strips [F#] tags, and says what the answer is based on when tags were used. */
 export function finishGrounded(raw: string, facts: Fact[]) {
   const used = [...new Set([...raw.matchAll(/\[((?:F\d+(?:,\s*)?)+)\]/g)].flatMap(m => m[1]!.split(/,\s*/)))].filter(t => facts.some(f => f.tag === t));
-  let text = raw.replace(/\s*\[(?:F\d+(?:,\s*)?)+\]/g, "").replace(/\s+([.,!?])/g, "$1").trim();
+  let text = raw.replace(/\s*\[(?:F\d+(?:,\s*)?)+\]/g, "").replace(/\s*\[[A-Z][A-Z0-9 ,_-]*\]/g, "") /* stray [IDEA]-style labels */.replace(/\s+([.,!?])/g, "$1").trim();
   if (used.length && !/\b(research|based on|according to|findings?|sources?)\b/i.test(text)) {
     const kinds = new Set(used.map(t => facts.find(f => f.tag === t)!.source));
     text = `${kinds.has("research") ? "From your research" : "From the skill write-up"}: ${text}`;
@@ -145,7 +147,7 @@ export function createExplorer(d: ExplorerDeps) {
     let facts: Fact[] = [];
     if (all.length) {
       const [qv] = await d.embed([question]); const fv = await cachedEmbed(all.map(f => f.text), factVecCache);
-      facts = all.map((f, i) => ({ ...f, sim: cosine(qv!, fv[i]!) })).sort((a, b) => b.sim - a.sim).slice(0, k).map((f, i) => ({ ...f, tag: `F${i + 1}` }));
+      facts = all.map((f, i) => ({ ...f, sim: cosine(qv!, fv[i]!) })).filter(f => f.sim >= FACT_MIN_SIM).sort((a, b) => b.sim - a.sim).slice(0, k).map((f, i) => ({ ...f, tag: `F${i + 1}` }));
     }
     return { title: idea.title, content: idea.content, evaluation, facts, recent: store.recentForIdea(ideaId, 6), summary: store.getSummary(ideaId)?.summary ?? null };
   }

@@ -40,3 +40,8 @@ section.topic h3 { text-transform: capitalize; }
 .kind.synthesis { background: #f3e8ff; color: #6b21a8; } .kind.verified { background: #dcf3e2; color: var(--ok); } .kind.computed { background: #eef1f5; color: var(--muted); }
 .prose { white-space: pre-wrap; } a.cite { font-size: 11px; text-decoration: none; vertical-align: super; }
 .diagram-wrap { margin: 10px 0 16px; } .diagram { overflow-x: auto; padding: 8px 0; } .diagram svg { max-width: 100%; height: auto; }
+.conv-summary { margin: 8px 0; padding: 8px 10px; background: #faf7ff; border-radius: 6px; }
+.conv-session { margin-top: 8px; } .conv-session > summary { cursor: pointer; }
+.conv-msg { padding: 4px 0 4px 8px; border-left: 2px solid var(--line); margin: 4px 0; } .conv-msg.note { border-left-color: var(--warn); background: #fffbeb; }
+.channel { display: inline-block; font-size: 11px; padding: 0 7px; border-radius: 8px; background: #eef1f5; color: var(--muted); }
+.channel.voice { background: #e0f2fe; color: #075985; } .channel.web { background: #ecfccb; color: #3f6212; }

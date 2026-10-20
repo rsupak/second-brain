@@ -26,6 +26,7 @@ import {
 import Database from "better-sqlite3";
 import { researchRoutes } from "./research-routes.js";
 import { skillsRoutes } from "./skills-routes.js";
+import { conversationsRoutes } from "./conversations-routes.js";
 import { addCrossSiteGuard } from "./security.js";
 import { createResearchJobStore } from "./research-jobs.js";
 
@@ -227,6 +228,7 @@ researchDb.pragma("foreign_keys = ON");
 researchDb.pragma("busy_timeout = 5000");
 app.register(researchRoutes, { db: researchDb });
 app.register(skillsRoutes, { db: researchDb });
+app.register(conversationsRoutes, { db: researchDb });
 
 async function start() {
   try {
