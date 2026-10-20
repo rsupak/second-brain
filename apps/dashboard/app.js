@@ -72,6 +72,38 @@ async function overview() {
   refreshTimer = setTimeout(() => { if (location.hash === "" || location.hash === "#/") overview(); }, 10000);
 }
 
+// Manual "Add idea" form. Same-origin POST /ideas with a JSON body (passes the cross-site guard).
+let lastAddNotice = null;
+function addIdeaForm() {
+  const title = el("input", { type: "text", maxlength: 200, required: true, placeholder: "Title", class: "wide" });
+  const content = el("textarea", { maxlength: 10000, required: true, rows: 4, placeholder: "Description", class: "wide" });
+  const notice = el("div", {}, lastAddNotice);
+  const submit = el("button", { type: "submit" }, "Add idea");
+  const form = el("form", { class: "card add-idea", onsubmit: async (ev) => {
+    ev.preventDefault();
+    const t = title.value.trim(), c = content.value.trim();
+    if (!t || !c) { notice.replaceChildren(el("div", { class: "notice bad" }, "Title and description are both required.")); return; }
+    submit.disabled = true;
+    try {
+      const r = await api("/ideas", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: t, content: c }) });
+      if (r.status === 201 && r.body?.idea?.id) {
+        const b = r.body, id = b.idea.id;
+        const q = [["expansion", b.jobId], ["evaluation", b.evaluationJobId], ["research", b.researchJobId]]
+          .map(([k, v]) => v ? `${k} (${v})` : v === null ? `${k} (queue failed)` : null).filter(Boolean);
+        lastAddNotice = el("div", { class: "notice ok" }, "Idea added: ", el("a", { href: `#/idea/${encodeURIComponent(id)}` }, b.idea.title),
+          `. Queued: ${q.length ? q.join(", ") : "nothing"}.`);
+        title.value = ""; content.value = "";
+        await ideas(); // refresh the list (form re-renders with the success notice)
+      } else {
+        const msg = r.body?.error ? `${r.body.error}` : "unknown error";
+        notice.replaceChildren(el("div", { class: "notice bad" }, `Could not add idea (HTTP ${r.status}): ${msg}`));
+      }
+    } catch (e) { notice.replaceChildren(el("div", { class: "notice bad" }, `Could not add idea: ${e && e.message ? e.message : e}`)); }
+    finally { submit.disabled = false; }
+  } }, el("strong", {}, "Add idea"), title, content, el("div", {}, submit), notice);
+  return el("details", { class: "add-wrap", open: lastAddNotice ? true : null }, el("summary", {}, "＋ Add idea"), form);
+}
+
 let ideaSort = { key: "score", dir: -1 };
 async function ideas() {
   const [ir, er] = await Promise.all([api("/ideas"), api("/evaluations")]);
@@ -84,7 +116,7 @@ async function ideas() {
     rows.sort((a, b) => { const x = val(a, key), y = val(b, key); if (x == null) return 1; if (y == null) return -1; return x < y ? -dir : x > y ? dir : 0; });
     const th = (k, label) => el("th", { class: "sortable", onclick: () => { ideaSort = { key: k, dir: ideaSort.key === k ? -ideaSort.dir : (k === "title" ? 1 : -1) }; draw(); } },
       label, ideaSort.key === k ? (ideaSort.dir > 0 ? " ▲" : " ▼") : "");
-    render(el("h2", {}, `Ideas (${rows.length})`),
+    render(el("h2", {}, `Ideas (${rows.length})`), addIdeaForm(),
       el("table", {}, el("tr", {}, th("title", "Title"), th("depth", "Depth"), th("feasibility", "Feas."), th("cost", "Cost"), th("relevance", "Rel."), th("novelty", "Nov."), th("score", "Score")),
         rows.map(r => el("tr", {},
           el("td", {}, el("a", { href: `#/idea/${encodeURIComponent(r.id)}` }, r.title)),
@@ -174,6 +206,7 @@ async function jobs() {
 // ---------- router ----------
 async function route() {
   clearTimeout(refreshTimer);
+  if (location.hash !== "#/ideas") lastAddNotice = null;
   const h = location.hash || "#/";
   document.querySelectorAll("nav a").forEach(a => a.classList.toggle("active",
     a.getAttribute("href") === h || (h.startsWith("#/idea/") && a.getAttribute("href") === "#/ideas")));

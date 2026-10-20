@@ -30,3 +30,5 @@ button:disabled { opacity: .5; cursor: default; }
 ul.tree { list-style: none; padding-left: 18px; margin: 4px 0; } ul.tree.root { padding-left: 0; }
 pre { white-space: pre-wrap; word-break: break-word; background: #f3f4f6; padding: 10px; border-radius: 6px; font-size: 12px; max-height: 320px; overflow: auto; }
 .scores span { margin-right: 12px; }
+input.wide, textarea.wide { display: block; width: 100%; font: inherit; padding: 6px 8px; margin: 6px 0; border: 1px solid var(--line); border-radius: 6px; }
+details.add-wrap { margin-bottom: 14px; } details.add-wrap > summary { cursor: pointer; color: var(--accent); font-weight: 600; margin-bottom: 8px; }
