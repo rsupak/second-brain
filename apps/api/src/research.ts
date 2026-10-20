@@ -22,6 +22,13 @@ export type ResearchDeps = {
   log?: (msg: string) => void;
   /** Return false to abort early (lease lost). */
   stillOwned?: () => boolean;
+  // Optional hooks (unset in normal research, so default behaviour is unchanged; deep-dive.ts sets them).
+  /** Extra search queries appended after the generated ones. */
+  extraQueries?: (idea: Idea, questions: string[]) => string[];
+  /** Drop candidates before fetching (e.g. off-domain titles). */
+  filterCandidates?: (idea: Idea, candidates: Candidate[]) => Promise<{ kept: Candidate[]; dropped: Array<{ url: string; title: string; reason: string }> }>;
+  /** Return false to skip a candidate before fetching (e.g. source-type mix caps). */
+  admitSource?: (c: Candidate, ctx: { usedTypes: SourceType[]; remaining: Candidate[] }) => boolean;
 };
 
 export const LIMITS = {
@@ -415,7 +422,9 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
 
   // 1. Queries
   let t = Date.now();
-  const { questions, queries, fallback, queryFallback } = await generateQueries(idea, deps);
+  const generated = await generateQueries(idea, deps);
+  const { questions, fallback, queryFallback } = generated;
+  const queries = deps.extraQueries ? [...new Set([...generated.queries, ...deps.extraQueries(idea, questions)])] : generated.queries;
   t = mark("queries_ms", t);
   log(`questions: ${JSON.stringify(questions)}`);
   log(`queries: ${JSON.stringify(queries)}`);
@@ -427,7 +436,10 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
     try { lists.push(await deps.search(q)); }
     catch (e) { searchErrors++; lists.push([]); log(`search failed for ${JSON.stringify(q)}: ${String(e).slice(0, 200)}`); }
   }
-  const candidates = pickCandidates(lists, LIMITS.maxCandidates);
+  let candidates = pickCandidates(lists, LIMITS.maxCandidates);
+  let candidatesDropped: Array<{ url: string; title: string; reason: string }> = [];
+  if (deps.filterCandidates) ({ kept: candidates, dropped: candidatesDropped } = await deps.filterCandidates(idea, candidates));
+  let skippedByMix = 0;
   t = mark("search_ms", t);
   ensureOwned();
 
@@ -437,8 +449,9 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
   const sourceMeta = new Map<string, { site: string; type: SourceType }>();
   const sourcesDetail: Array<{ url: string; site: string; type: SourceType; query: number; used: boolean; error: string | null }> = [];
   let fetched = 0, fetchFailed = 0, sourcesInUse = 0;
-  for (const c of candidates) {
+  for (const [ci, c] of candidates.entries()) {
     if (fetched >= LIMITS.maxSources) break;
+    if (deps.admitSource && !deps.admitSource(c, { usedTypes: [...sourceMeta.values()].map(m => m.type), remaining: candidates.slice(ci + 1) })) { skippedByMix++; continue; }
     const res = await deps.fetch(c.url);
     if (res.error) { fetchFailed++; log(`fetch failed ${c.url}: ${res.error}`); }
     let id: string | undefined;
@@ -550,7 +563,7 @@ export async function runResearch(db: Database.Database, idea: Idea, deps: Resea
     dropped,
     result: {
       questions, queries, queryFallback: fallback, queryFallbackKind: queryFallback, searchErrors,
-      candidates: candidates.length, sources: sourceIds.length, fetched, fetchFailed, sourcesInUse,
+      candidates: candidates.length, ...(deps.filterCandidates ? { candidatesDropped } : {}), ...(deps.admitSource ? { skippedByMix } : {}), sources: sourceIds.length, fetched, fetchFailed, sourcesInUse,
       chunksTotal: chunkRows.length, chunksEmbedded, rankedChunks: top.length,
       rankedSources: new Set(top.map(c => c.source_id)).size,
       distinctSites: new Set(sourcesDetail.filter(d => d.used).map(d => d.site)).size,

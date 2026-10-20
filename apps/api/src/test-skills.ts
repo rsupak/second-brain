@@ -9,7 +9,7 @@ import { sha256, verifyQuote, type FetchResult } from "./research-sources.js";
 import { LIMITS, type ChatMessage, type ResearchDeps } from "./research.js";
 import { ensureSkillTables, skillState } from "./skills-schema.js";
 import { createSkillStore, ActiveDeepDiveError, SkillExistsError, LeaseLostError } from "./skill-jobs.js";
-import { checkCitations, buildSections, withDeepLimits, runDeepDive, DEEP_LIMITS } from "./deep-dive.js";
+import { checkCitations, buildSections, withDeepLimits, runDeepDive, DEEP_LIMITS, practicalQueries, titleGate, paperCap, relevanceGate, dedupeList, writeupPrompt, QUALITY } from "./deep-dive.js";
 import { skillsRoutes, clusterTopics } from "./skills-routes.js";
 import { addCrossSiteGuard } from "./security.js";
 
@@ -25,6 +25,11 @@ function check(name: string, ok: boolean, detail?: unknown) {
 }
 const n = (sql: string, ...a: unknown[]) => (db.prepare(sql).get(...a) as { n: number }).n;
 const counts = () => Object.fromEntries(["ideas", "jobs", "research_findings", "research_sources", "research_chunks", "idea_evaluations", "evaluation_jobs", "memories"].map(t => [t, n(`SELECT COUNT(*) n FROM ${t}`)]));
+// Test isolation on the COPY only: park deep_dive jobs that were already queued in the copied DB so claim() sees only this test's jobs.
+const parked = db.prepare(`UPDATE jobs SET status = 'failed', error = 'parked by test-skills (copy only)' WHERE type = 'deep_dive' AND status IN ('pending','running')`).run().changes;
+const deepBefore = n("SELECT COUNT(*) n FROM jobs WHERE type='deep_dive'");
+const skillsBefore = n("SELECT COUNT(*) n FROM skills");
+console.log(`(copy had ${parked} queued deep_dive job(s), parked; ${skillsBefore} existing skill(s))`);
 const before = counts();
 
 // ---------- migration ----------
@@ -36,6 +41,8 @@ check("migration did not change existing tables", JSON.stringify(counts()) === J
 // ---------- unit ----------
 const cc = checkCitations("A [F1] b [F7] c [F2].", 2);
 check("checkCitations keeps valid, strips invalid", cc.text === "A [F1] b c [F2]." && cc.removed === 1 && cc.cited.join() === "1,2", cc);
+const cg = checkCitations("See [F3, F5] and [F2,F9].", 5);
+check("checkCitations splits grouped citations and validates each", cg.text === "See [F3] [F5] and [F2]." && cg.removed === 1 && cg.cited.join() === "2,3,5", cg);
 const bs = buildSections(null, [], ["Q1?"], { ideas: [], skills: [] });
 check("buildSections without facts: no invented prose, key facts empty, unanswered question listed",
   bs.sections.find(s => s.key === "key_facts")!.items!.length === 0 && bs.sections.find(s => s.key === "open_questions")!.items![0] === "Q1?"
@@ -58,13 +65,17 @@ const PAGES: Record<string, string> = {
   "https://bake.example/temp": "Sourdough yeast is most active near 26 degrees Celsius. Cold temperature slows the starter. Whole grain flour feeds yeast faster.",
   "https://wiki.example/sourdough": "Sourdough bread uses a starter instead of commercial yeast. The flour type changes sourdough flavor."
 };
-const fetchFake = (url: string): Promise<FetchResult> => {
+const fetchFake = (url: string): Promise<FetchResult> => { fetchedUrls.push(url);
   const text = PAGES[url]; const base = { url, final_url: url, title: `T ${url}`, content_type: "text/plain", fetched_at: Date.now() };
   return Promise.resolve(text ? { ...base, http_status: 200, text, content_hash: sha256(text), error: null } : { ...base, http_status: 404, text: null, content_hash: null, error: "HTTP 404" });
 };
-const searchFake = (_q: string) => Promise.resolve(Object.keys(PAGES).map(url => ({ url, title: url })));
+const searchQueries: string[] = [];
+const searchFake = (q: string) => { searchQueries.push(q); return Promise.resolve([...Object.keys(PAGES).map(url => ({ url, title: `sourdough starter yeast ${url}` })),
+  { url: "https://physics.example/streaks", title: "Low-speed streaks in a turbulent boundary layer" }]); };
+const fetchedUrls: string[] = [];
 const KEYS = ["sourdough", "starter", "yeast", "temperature", "flour"];
-const embedFake = (texts: string[]) => Promise.resolve(texts.map(t => KEYS.map(k => (t.toLowerCase().split(k).length - 1) + 0.01)));
+// Last dimension marks text with none of the keywords, so off-domain text is near-orthogonal to on-domain text.
+const embedFake = (texts: string[]) => Promise.resolve(texts.map(t => { const v = KEYS.map(k => (t.toLowerCase().split(k).length - 1) + 0.01); return [...v, v.every(x => x < 1) ? 1 : 0.01]; }));
 const prompts: Record<string, string> = {};
 let writeupMode: "good" | "bad" = "good";
 const llmFake = (messages: ChatMessage[]): Promise<string> => {
@@ -77,6 +88,10 @@ const llmFake = (messages: ChatMessage[]): Promise<string> => {
     const k = (user.match(/ITEM \d+/g) ?? []).length;
     return Promise.resolve(JSON.stringify({ results: Array.from({ length: k }, (_, i) => ({ index: i + 1, supported: "yes", subject: "sourdough" })) }));
   }
+  if (sys.includes("check whether evidence is relevant")) { prompts.relevance = user;
+    const items = [...user.matchAll(/ITEM (\d+)\nFACT: ([^\n]*)/g)];
+    return Promise.resolve(JSON.stringify({ results: items.map(m => ({ index: Number(m[1]), relevant: /bread/i.test(m[2]!) ? "off_topic" : "direct", reason: "fake" })) }));
+  }
   if (sys.includes("extract evidence")) { prompts.synth = sys;
     const ex = [...user.matchAll(/\[(\d+)\] \([^)]*\)\n([^\n]+)/g)];
     const findings = ex.map(m => { const first = m[2]!.split(/(?<=\.)\s/)[0]!; return { claim: first.replace(/\.$/, ""), quote: first, chunk: Number(m[1]) }; });
@@ -85,12 +100,37 @@ const llmFake = (messages: ChatMessage[]): Promise<string> => {
   }
   if (sys.includes("study guide")) { prompts.writeup = user;
     if (writeupMode === "bad") return Promise.resolve("not json at all");
-    return Promise.resolve(JSON.stringify({ summary: "How sourdough starters work.", overview: "A starter is a yeast culture [F1]. It is famous on Mars [F42].",
-      how_it_works: "Yeast activity depends on temperature [F2].", practical_steps: ["Feed the starter daily [F1]", "Keep it warm"], open_questions: ["How long can a starter be stored?"], tags: ["Baking", "fermentation"] }));
+    return Promise.resolve(JSON.stringify({ summary: "How sourdough starters work.", _dup: 0, overview: "A starter is a yeast culture [F1]. It is famous on Mars [F42].",
+      how_it_works: "Yeast activity depends on temperature [F2].", practical_steps: ["Feed the starter daily [F1]", "Keep it warm", "keep it WARM!"], open_questions: ["How long can a starter be stored?", "How long can a starter be stored ?"], tags: ["Baking", "fermentation"] }));
   }
   return Promise.reject(new Error(`unexpected prompt: ${sys.slice(0, 60)}`));
 };
 const deps: ResearchDeps = { search: searchFake, fetch: fetchFake, embed: embedFake, llm: llmFake as ResearchDeps["llm"] };
+
+// ---------- deep-dive quality gates (unit) ----------
+const pq = practicalQueries({ id: "x", title: "Habit tracker", content: "" });
+check("practicalQueries: guide / how to / app review / best practices / forum", pq.join("|") === "Habit tracker guide|how to Habit tracker|Habit tracker app review|Habit tracker best practices|Habit tracker reddit forum", pq);
+const tg = await titleGate(embedFake)({ id: "x", title: "Sourdough starter", content: "yeast flour temperature" },
+  [{ url: "a", title: "Sourdough starter yeast guide", site: "a", type: "blog", query: 0 }, { url: "b", title: "Turbulent boundary layer streaks", site: "b", type: "paper", query: 0 }, { url: "c", title: "", site: "c", type: "docs", query: 0 }]);
+check("titleGate drops off-domain title, keeps on-domain and untitled", tg.kept.map(c => c.url).join() === "a,c" && tg.dropped[0]?.url === "b", tg);
+check("titleGate threshold calibrated between streaks (0.401) and next-lowest title (0.495)", QUALITY.minTitleSim > 0.401 && QUALITY.minTitleSim < 0.495);
+const cap = paperCap(() => 4);
+const P = (u: string) => ({ url: u, title: u, site: u, type: "paper" as const, query: 0 }), Bl = (u: string) => ({ url: u, title: u, site: u, type: "blog" as const, query: 0 });
+check("paperCap: papers allowed below 50%", cap(P("p"), { usedTypes: ["paper"], remaining: [Bl("b")] }));
+check("paperCap: paper refused at 50% when non-papers remain", !cap(P("p"), { usedTypes: ["paper", "paper"], remaining: [Bl("b")] }));
+check("paperCap: paper allowed at 50% when no alternatives remain", cap(P("p"), { usedTypes: ["paper", "paper"], remaining: [P("q")] }));
+check("paperCap: non-papers always allowed", cap(Bl("b"), { usedTypes: ["paper", "paper", "paper"], remaining: [] }));
+const relIdea = { id: "x", title: "Sourdough starter", content: "yeast flour temperature" };
+const rel = await relevanceGate(relIdea, [{ claim: "Starter yeast likes warm temperature", quote: "Starter yeast likes warm temperature." },
+  { claim: "Sourdough bread is popular", quote: "Sourdough bread is popular in sourdough bakeries with yeast." }, { claim: "Turbulence", quote: "Boundary layers form streaks." }], { embed: embedFake, llm: llmFake as ResearchDeps["llm"] });
+check("relevanceGate: direct kept, judge off_topic dropped, below-floor dropped without judge",
+  rel[0]!.relevant && rel[0]!.scope === "direct" && !rel[1]!.relevant && rel[1]!.scope === "off_topic" && !rel[2]!.relevant && /floor/.test(rel[2]!.reason) && !/ITEM 3/.test(prompts.relevance ?? ""), rel);
+const relFail = await relevanceGate(relIdea, [{ claim: "Starter yeast likes warm temperature", quote: "Starter yeast likes warm temperature." }], { embed: embedFake, llm: () => Promise.resolve("garbage") });
+check("relevanceGate: judge failure keeps facts above the floor as unjudged", relFail[0]!.relevant && /unjudged/.test(relFail[0]!.reason));
+const dd = await dedupeList(["Keep it warm", "keep it WARM!", "Feed the starter", "Feed the starter flour"], (t: string[]) => Promise.resolve(t.map(x => x.includes("Feed") ? [1, 0] : [0, 1])));
+check("dedupeList: normalized-text and embedding duplicates removed", dd.items.join("|") === "Keep it warm|Feed the starter" && dd.removed === 2, dd);
+const wp = writeupPrompt(relIdea, [{ n: 1, scope: "related", claim: "UI adapts", quote: "q", chunk_id: "c", source_id: "s", url: "u", title: null, question: null }], []);
+check("write-up prompt forbids stretching scope and tags general evidence", /Never stretch a fact's scope/.test(wp.system) && /\[F1\] \(general\/adjacent evidence/.test(wp.user));
 
 // ---------- store + mocked deep dive ----------
 const store = createSkillStore(db);
@@ -119,6 +159,10 @@ check("write-up prompt contains only numbered facts", /VERIFIED FACTS:\n\[F1\]/.
 const ov = res.sections.find(s => s.key === "overview")!;
 check("citation to a nonexistent fact removed", !ov.text!.includes("[F42]") && ov.text!.includes("[F1]") && res.stats.removedCitations === 1, ov.text);
 check("tags lowercased", res.tags.join() === "baking,fermentation");
+check("deep dive searched practical query variants", pq.length === 5 && searchQueries.some(q => / guide$/.test(q)) && searchQueries.some(q => /^how to /.test(q)) && searchQueries.some(q => / best practices$/.test(q)), searchQueries.slice(-6));
+check("off-domain title dropped before fetching", !fetchedUrls.includes("https://physics.example/streaks") && (res.stats.candidatesDropped as any[]).some(d => /streaks/.test(d.url)));
+check("off-topic fact (judge) dropped and reported", (res.stats.droppedOffTopic as number) >= 1 && !kf.some(f => /bread/i.test(f.claim)), res.stats.offTopic);
+check("steps/open questions deduped", (res.sections.find(s => s.key === "practical_steps")!.items as string[]).length === 2 && (res.stats.dedupeRemoved as any).steps === 1 && (res.stats.dedupeRemoved as any).openQuestions >= 1, res.stats.dedupeRemoved);
 check("sources linked to existing research_sources", res.sources.length > 0 && res.sources.every(s => n("SELECT COUNT(*) n FROM research_sources WHERE id = ?", s.source_id) === 1));
 check("stats include duration + section lengths", typeof res.stats.total_ms === "number" && typeof (res.stats.sectionChars as any).overview === "number");
 
@@ -175,7 +219,7 @@ r = await app.inject({ method: "POST", url: `/skills/${created.skillId}/refresh`
 check("POST /skills/:id/refresh -> 202 version 3", r.statusCode === 202 && r.json().version === 3, r.body);
 r = await app.inject({ method: "GET", url: "/skills" });
 const list = r.json();
-check("GET /skills lists both, with topic/facts/latestJob", r.statusCode === 200 && list.length === 2 && list.every((s: any) => "topic" in s && "facts" in s && "latestJob" in s), list);
+check("GET /skills lists both, with topic/facts/latestJob", r.statusCode === 200 && list.length === 2 + skillsBefore && list.every((s: any) => "topic" in s && "facts" in s && "latestJob" in s), list);
 r = await app.inject({ method: "GET", url: "/skills?q=fermentation" });
 check("GET /skills?q= matches tags", r.json().length === 1 && r.json()[0].id === created.skillId, r.json());
 r = await app.inject({ method: "GET", url: "/skills?q=zzzz_no_match%25" });
@@ -194,7 +238,7 @@ r = await app.inject({ method: "GET", url: `/ideas/${idea2.id}/skill` });
 check("GET /ideas/:id/skill shows pending skill + job", r.statusCode === 200 && r.json().skill.status === "pending" && r.json().latestJob.status === "pending", r.body);
 
 const after = counts();
-check("only ideas count unchanged; jobs grew only by deep_dive jobs", after.ideas === before.ideas && after.jobs - before.jobs === n("SELECT COUNT(*) n FROM jobs WHERE type='deep_dive'"), { before, after });
+check("only ideas count unchanged; jobs grew only by deep_dive jobs", after.ideas === before.ideas && after.jobs - before.jobs === n("SELECT COUNT(*) n FROM jobs WHERE type='deep_dive'") - deepBefore, { before, after });
 await app.close();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
