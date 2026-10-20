@@ -1,17 +1,16 @@
 #!/bin/bash
 # Manage Second Brain background workers as launchd user agents (the API dev server is NOT managed here).
 # Usage: scripts/brain-services.sh install|start|stop|restart|status|uninstall [worker|evaluate|research|voice|deepdive]
-# deepdive is OPTIONAL: it is never included in the no-argument commands; manage it only by name, e.g.
-#   scripts/brain-services.sh start deepdive
+# All five services (including deepdive) are in the default set, so install/start cover them and they start at login.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTS="$HOME/Library/LaunchAgents"
 NODE_BIN="$(dirname "$(command -v node || echo /opt/homebrew/opt/node@24/bin/node)")"
 DOMAIN="gui/$(id -u)"
 # label  script
-SERVICES=("org.secondbrain.worker:worker.ts" "org.secondbrain.evaluate:evaluation-worker.ts" "org.secondbrain.research:research-worker.ts" "org.secondbrain.voice:voice/voice-server.ts")
-# Optional services: only acted on when named as the 2nd argument.
-OPTIONAL=("org.secondbrain.deepdive:deep-dive-worker.ts")
+SERVICES=("org.secondbrain.worker:worker.ts" "org.secondbrain.evaluate:evaluation-worker.ts" "org.secondbrain.research:research-worker.ts" "org.secondbrain.voice:voice/voice-server.ts" "org.secondbrain.deepdive:deep-dive-worker.ts")
+# Optional services: only acted on when named as the 2nd argument (none at the moment).
+OPTIONAL=()
 
 plist() { # label script
   local label=$1 script=$2 name=${1##*.}
@@ -73,7 +72,7 @@ status() {
 }
 # Optional 2nd arg limits the command to one service: worker | evaluate | research | voice
 if [ -n "${2:-}" ]; then
-  match=(); for s in "${SERVICES[@]}" "${OPTIONAL[@]}"; do [ "${s%%:*}" = "org.secondbrain.$2" ] && match+=("$s"); done
+  match=(); for s in "${SERVICES[@]}" ${OPTIONAL[@]+"${OPTIONAL[@]}"}; do [ "${s%%:*}" = "org.secondbrain.$2" ] && match+=("$s"); done
   [ ${#match[@]} -eq 1 ] || { echo "Unknown service: $2 (worker|evaluate|research|voice|deepdive)"; exit 2; }
   SERVICES=("${match[@]}")
 fi
