@@ -29,7 +29,10 @@ export const LIMITS = {
   topChunks: 6, maxChunksPerSite: 2, maxFindingsPerSite: 2, embedBatch: 16,
   chunksPerQuestion: 2, maxExcerpts: 8, maxExcerptChars: 1200, maxExcerptTotalChars: 16000,
   /** Min cosine(claim, question) to assign a claim to a question; below it the claim is off-topic. */
-  minQuestionSim: Number(process.env.RESEARCH_MIN_QUESTION_SIM ?? 0.6)
+  minQuestionSim: Number(process.env.RESEARCH_MIN_QUESTION_SIM ?? 0.6),
+  // Prompt/model budgets (defaults reproduce the original research prompts exactly; deep-dive.ts raises them).
+  minQuestions: 3, maxFindings: 8, synthNumPredict: 1200, synthNumCtx: 8192, judgeNumPredict: 800,
+  questionsNumPredict: 400, queriesNumPredict: 300, questionModel: undefined as string | undefined
 };
 
 /** Model for synthesis and the support judge. Questions/queries stay on the generateResponse default. */
@@ -183,14 +186,14 @@ export async function generateQueries(idea: Idea, deps: ResearchDeps): Promise<{
   let questions: string[] = [];
   try {
     const raw = await deps.llm([
-      { role: "system", content: `You help evaluate an idea. List the 3 to 5 most important open questions the idea depends on
+      { role: "system", content: `You help evaluate an idea. List the ${LIMITS.minQuestions} to ${LIMITS.maxQueries} most important open questions the idea depends on
 (for example: feasibility, cost, limitations, existing evidence or prior work, real-world examples).
 Each question must be specific and answerable with evidence from the web.
 Do not invent numbers, intervals, capacities, battery sizes or other parameters that are not stated in the idea.
 Return ONLY JSON: {"questions": ["...", "..."]}. No markdown, no commentary.` },
       { role: "user", content: `Idea title: ${idea.title}\nDescription: ${idea.content}` }
     // JSON mode: in plain-text mode qwen3:4b leaks its reasoning instead of a list.
-    ], { format: "json", temperature: 0, numPredict: 400 });
+    ], { format: "json", temperature: 0, numPredict: LIMITS.questionsNumPredict, ...(LIMITS.questionModel ? { model: LIMITS.questionModel } : {}) });
     const parsed = QuestionsSchema.safeParse((() => { try { return extractJsonObject(raw); } catch { return null; } })());
     questions = parsed.success
       ? [...new Set(parsed.data.questions.map(q => q.trim()))].slice(0, LIMITS.maxQueries)
@@ -208,7 +211,7 @@ Return ONLY JSON: {"questions": ["...", "..."]}. No markdown, no commentary.` },
 Each query: 3 to 8 keywords, no question words, no repetition.
 Return ONLY JSON: {"queries": ["query for question 1", "query for question 2", ...]} in the same order. No markdown, no commentary.` },
       { role: "user", content: `Idea title: ${idea.title}\n\nQuestions:\n${questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}\n\nWrite one search query per question as {"queries": [...]}.` }
-    ], { format: "json", temperature: 0, numPredict: 300 });
+    ], { format: "json", temperature: 0, numPredict: LIMITS.queriesNumPredict, ...(LIMITS.questionModel ? { model: LIMITS.questionModel } : {}) });
     const parsed = QueriesSchema.parse(extractJsonObject(raw));
     const queries = [...new Set(parsed.queries.map(q => q.trim()))].slice(0, LIMITS.maxQueries);
     return { questions, queries, fallback: false, queryFallback: "none" };
@@ -325,7 +328,7 @@ export async function checkSupport(
 Also give "subject": a short phrase (2 to 6 words) naming what the claim is about.
 Return ONLY JSON: {"results": [{"index": N, "supported": "yes"|"partial"|"no", "subject": "..."}]} with one entry per item.` },
         { role: "user", content: items.map(it => `ITEM ${it.index}\nCLAIM: ${it.claim}\nQUOTE: ${it.quote}`).join("\n\n") }
-      ], { format: "json", temperature: 0, numPredict: 800, numCtx: 8192, model: SYNTH_MODEL });
+      ], { format: "json", temperature: 0, numPredict: LIMITS.judgeNumPredict, numCtx: LIMITS.synthNumCtx, model: SYNTH_MODEL });
       lastRaw = raw;
       const parsed = SupportSchema.parse(extractJsonObject(raw));
       const byIndex = new Map(parsed.results.map(r => [r.index, r]));
@@ -376,10 +379,10 @@ Rules:
 - The claim must name the specific subject the quote is about (the exact product, study, method, place or organisation), not a more general one.
 - "chunk" is the number of the excerpt containing the quote.
 - Use only the excerpts. If an excerpt has nothing useful, skip it. If nothing is useful, return {"findings": []}.
-- At most 8 findings. No markdown, no commentary.`;
+- At most ${LIMITS.maxFindings} findings. No markdown, no commentary.`;
   const user = `IDEA: ${idea.title}\n${idea.content}${qBlock}\n\nEXCERPTS:\n${numbered}`;
   const raw = await deps.llm([{ role: "system", content: system }, { role: "user", content: user }],
-    { format: "json", temperature: 0, numPredict: 1200, numCtx: 8192, model: SYNTH_MODEL });
+    { format: "json", temperature: 0, numPredict: LIMITS.synthNumPredict, numCtx: LIMITS.synthNumCtx, model: SYNTH_MODEL });
   const diag = { promptChars: system.length + user.length, raw };
 
   const parsed = FindingsSchema.parse(extractJsonObject(raw));

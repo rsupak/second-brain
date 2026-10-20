@@ -10,7 +10,8 @@
     "worker": "tsx apps/api/src/worker.ts",
     "evaluate": "tsx apps/api/src/evaluation-worker.ts",
     "research": "tsx apps/api/src/research-worker.ts",
-    "voice": "tsx apps/api/src/voice/voice-server.ts"
+    "voice": "tsx apps/api/src/voice/voice-server.ts",
+    "deep-dive": "tsx apps/api/src/deep-dive-worker.ts"
   },
   "keywords": [],
   "author": "",
