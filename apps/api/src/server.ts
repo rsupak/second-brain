@@ -229,7 +229,7 @@ app.register(researchRoutes, { db: researchDb });
 async function start() {
   try {
     await app.listen({
-      port: 3333,
+      port: Number(process.env.PORT ?? 3333),
       host: "127.0.0.1"
     });
   } catch (error) {
