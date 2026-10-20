@@ -9,7 +9,7 @@ import { cosine, fromBlob, siteKey, sourceType } from "./research.js";
 const IdParams = z.object({ id: z.string().trim().min(1).max(128) });
 const parse = (s: string | null, d: unknown = null) => { if (s == null) return d; try { return JSON.parse(s); } catch { return d; } };
 
-/** Greedy single-pass clustering on skill embeddings; label = most common tag in the cluster. */
+/** Greedy single-pass clustering on skill embeddings; label = most common tag in the cluster (ties: first tag seen, i.e. the write-up's primary tag). */
 export function clusterTopics(items: Array<{ id: string; tags: string[]; vec: Float32Array | null }>, threshold = 0.62) {
   const clusters: Array<{ members: typeof items; centroid: Float32Array | null }> = [];
   for (const it of items) {
@@ -25,7 +25,7 @@ export function clusterTopics(items: Array<{ id: string; tags: string[]; vec: Fl
   for (const c of clusters) {
     const counts = new Map<string, number>();
     for (const m of c.members) for (const t of m.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
-    const label = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? "uncategorized";
+    const label = [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "uncategorized";
     for (const m of c.members) topic.set(m.id, label);
   }
   return topic;

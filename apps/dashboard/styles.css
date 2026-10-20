@@ -32,3 +32,10 @@ pre { white-space: pre-wrap; word-break: break-word; background: #f3f4f6; paddin
 .scores span { margin-right: 12px; }
 input.wide, textarea.wide { display: block; width: 100%; font: inherit; padding: 6px 8px; margin: 6px 0; border: 1px solid var(--line); border-radius: 6px; }
 details.add-wrap { margin-bottom: 14px; } details.add-wrap > summary { cursor: pointer; color: var(--accent); font-weight: 600; margin-bottom: 8px; }
+.skill-tile { display: block; color: var(--fg); text-decoration: none; } .skill-tile:hover { border-color: var(--accent); }
+.tile-title { font-weight: 600; color: var(--accent); margin-bottom: 4px; } .tile-summary { margin-top: 6px; color: #374151; }
+.tag { display: inline-block; font-size: 11px; padding: 0 7px; margin: 4px 4px 0 0; border-radius: 8px; background: #eaf0fb; color: var(--accent); }
+section.topic h3 { text-transform: capitalize; }
+.kind { font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 8px; vertical-align: middle; }
+.kind.synthesis { background: #f3e8ff; color: #6b21a8; } .kind.verified { background: #dcf3e2; color: var(--ok); } .kind.computed { background: #eef1f5; color: var(--muted); }
+.prose { white-space: pre-wrap; } a.cite { font-size: 11px; text-decoration: none; vertical-align: super; }

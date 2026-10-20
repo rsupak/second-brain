@@ -160,6 +160,7 @@ async function ideaDetail(id) {
     el("p", {}, el("a", { href: "#/ideas" }, "← Ideas")),
     el("h2", {}, idea ? idea.title : id),
     el("div", { class: "card" }, el("div", {}, idea?.content ?? ""), el("div", { class: "muted small" }, `origin ${idea?.origin ?? "?"} · created ${fmtTime(idea?.created_at)}`)),
+    skillCard(id),
     el("h3", {}, "Evaluation"),
     ev ? el("div", { class: "card" },
       el("div", { class: "scores" }, ...["feasibility", "cost", "relevance", "novelty"].map(k => el("span", {}, `${k}: `, el("strong", {}, ev[k]))), el("span", {}, "score: ", el("strong", {}, score(ev)))),
@@ -203,15 +204,145 @@ async function jobs() {
         el("td", { class: "small" }, j.error || "")))) : el("p", { class: "muted" }, "No research jobs"));
 }
 
+
+// ---------- skills (memory palace) ----------
+const SKILL_POLL_MS = 15000;
+function skillStatus(s, job) {
+  const st = job && (job.status === "pending" || job.status === "running") ? job.status : s.status;
+  return el("span", {}, pill(st === "ready" ? "completed" : st), st === "ready" ? "" : ` ${st}`, s.version ? el("span", { class: "muted small" }, ` · v${s.version}`) : null);
+}
+
+// "Make this a skill" card on the idea page, with live status.
+function skillCard(ideaId) {
+  const box = el("div", { class: "card skill-card" }, el("span", { class: "muted" }, "Checking skill…"));
+  let timer = null;
+  const load = async () => {
+    clearTimeout(timer);
+    if (!document.body.contains(box) && timer !== null) return;
+    const r = await api(`/ideas/${encodeURIComponent(ideaId)}/skill`);
+    if (!r.ok) { box.replaceChildren(errorBox(`GET /ideas/:id/skill failed (${r.status})`)); return; }
+    const { skill, latestJob } = r.body;
+    const notice = el("div", {});
+    if (!skill) {
+      const b = el("button", { onclick: async () => {
+        b.disabled = true;
+        const x = await api(`/ideas/${encodeURIComponent(ideaId)}/skill`, { method: "POST" });
+        if (x.status === 202) await load();
+        else { notice.replaceChildren(el("div", { class: "notice bad" }, `Could not create skill (HTTP ${x.status}): ${x.body?.error ?? ""}`)); b.disabled = false; }
+      } }, "Make this a skill");
+      box.replaceChildren(el("strong", {}, "Skill "), el("span", { class: "muted small" }, "A deep dive: more questions and sources, then a write-up built from verified facts."), el("div", { style: "margin-top:8px" }, b), notice);
+      return;
+    }
+    const active = latestJob && (latestJob.status === "pending" || latestJob.status === "running");
+    box.replaceChildren(el("strong", {}, "Skill: "), el("a", { href: `#/skill/${encodeURIComponent(skill.id)}` }, skill.title), " ", skillStatus(skill, latestJob),
+      active ? el("div", { class: "small muted" }, `Deep dive ${latestJob.status} (v${latestJob.version}). The deep-dive worker must be running to process it.`) : null,
+      skill.status === "failed" && skill.error ? el("div", { class: "small", style: "color:var(--bad)" }, skill.error) : null);
+    if (active) timer = setTimeout(() => { if (document.body.contains(box)) load(); }, SKILL_POLL_MS);
+  };
+  load();
+  return box;
+}
+
+let skillQuery = "";
+async function skills() {
+  const input = el("input", { type: "search", placeholder: "Search skills (title, summary, tags, content)…", class: "wide", value: skillQuery });
+  const results = el("div", {}, el("p", { class: "muted" }, "Loading…"));
+  let debounce = null;
+  const load = async () => {
+    const r = await api(`/skills${skillQuery ? `?q=${encodeURIComponent(skillQuery)}` : ""}`);
+    if (!r.ok) { results.replaceChildren(errorBox(`GET /skills failed (${r.status})`)); return; }
+    if (!r.body.length) { results.replaceChildren(el("p", { class: "muted" }, skillQuery ? "No skills match." : "No skills yet. Open an idea and press “Make this a skill”.")); return; }
+    const groups = new Map();
+    for (const s of r.body) { const t = s.topic || "uncategorized"; if (!groups.has(t)) groups.set(t, []); groups.get(t).push(s); }
+    const ordered = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+    results.replaceChildren(...ordered.map(([topic, list]) => el("section", { class: "topic" },
+      el("h3", {}, topic, el("span", { class: "muted small" }, ` · ${list.length}`)),
+      el("div", { class: "grid" }, list.map(s => el("a", { class: "card skill-tile", href: `#/skill/${encodeURIComponent(s.id)}` },
+        el("div", { class: "tile-title" }, s.title),
+        el("div", { class: "small" }, skillStatus(s, s.latestJob), el("span", { class: "muted" }, ` · ${s.facts} verified facts · ${s.sources} sources`)),
+        s.summary ? el("div", { class: "small tile-summary" }, s.summary) : null,
+        s.tags.length ? el("div", {}, s.tags.map(t => el("span", { class: "tag" }, t))) : null))))));
+  };
+  input.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(() => { skillQuery = input.value.trim(); load(); }, 250); });
+  render(el("h2", {}, "Skills palace"), input, results);
+  await load();
+  input.focus();
+}
+
+function citeText(text) {
+  // Renders "[F3]" citations as links to the fact anchors; everything else stays a text node.
+  const parts = String(text || "").split(/(\[F\d+\])/g);
+  return parts.map(p => { const m = /^\[F(\d+)\]$/.exec(p); return m ? el("a", { href: "#", class: "cite", onclick: (e) => { e.preventDefault(); document.getElementById(`fact-${m[1]}`)?.scrollIntoView({ behavior: "smooth", block: "center" }); } }, p) : p; });
+}
+
+async function skillDetail(id, version) {
+  const r = await api(`/skills/${encodeURIComponent(id)}${version ? `?version=${encodeURIComponent(version)}` : ""}`);
+  if (r.status === 404) return render(el("p", {}, el("a", { href: "#/skills" }, "← Skills")), errorBox("Skill or version not found"));
+  if (!r.ok) return render(errorBox(`GET /skills/:id failed (${r.status})`));
+  const d = r.body, s = d.skill, job = d.latestJob;
+  const active = job && (job.status === "pending" || job.status === "running");
+  const notice = el("div", {});
+  const refresh = el("button", { disabled: active || null, onclick: async () => {
+    refresh.disabled = true;
+    const x = await api(`/skills/${encodeURIComponent(id)}/refresh`, { method: "POST" });
+    if (x.status === 202) notice.replaceChildren(el("div", { class: "notice ok" }, `Refresh queued as version ${x.body.version}. The current version stays readable until it finishes.`));
+    else if (x.status === 409) notice.replaceChildren(el("div", { class: "notice warn" }, "A deep dive is already running for this skill."));
+    else { notice.replaceChildren(el("div", { class: "notice bad" }, `Could not refresh (HTTP ${x.status}).`)); refresh.disabled = false; }
+  } }, "Refresh (new version)");
+  const sec = (k) => d.sections.find(x => x.key === k);
+  const kind = (x) => el("span", { class: `kind ${x.kind}` }, x.kind === "verified" ? "verified facts" : x.kind === "computed" ? "computed" : "synthesis");
+  const head = (x) => el("h3", {}, x.title, " ", kind(x));
+  const prose = (k) => { const x = sec(k); return x ? el("section", { class: "card" }, head(x), x.text ? el("p", { class: "prose" }, citeText(x.text)) : el("p", { class: "muted" }, "Nothing written.")) : null; };
+  const list = (k, ordered) => { const x = sec(k); return x ? el("section", { class: "card" }, head(x), (x.items || []).length ? el(ordered ? "ol" : "ul", {}, x.items.map(i => el("li", {}, citeText(i)))) : el("p", { class: "muted" }, "None.")) : null; };
+  const facts = sec("key_facts");
+  const rel = (sec("related")?.items || [])[0] || { ideas: [], skills: [] };
+  const viewingOld = d.viewVersion && d.viewVersion !== s.version;
+  render(
+    el("p", {}, el("a", { href: "#/skills" }, "← Skills")),
+    el("h2", {}, s.title),
+    el("div", { class: "card" },
+      el("div", {}, skillStatus(s, job), el("span", { class: "muted small" }, ` · topic ${s.topic} · parent idea `), el("a", { href: `#/idea/${encodeURIComponent(d.idea.id)}` }, d.idea.title)),
+      d.summary ? el("p", {}, d.summary) : null,
+      d.tags.length ? el("div", {}, d.tags.map(t => el("span", { class: "tag" }, t))) : null,
+      active ? el("div", { class: "small muted" }, `Deep dive ${job.status} for v${job.version}.`) : null,
+      s.status === "failed" && s.error ? el("div", { class: "small", style: "color:var(--bad)" }, s.error) : null,
+      el("div", { style: "margin-top:8px" }, refresh), notice),
+    viewingOld ? el("div", { class: "notice warn" }, `You are viewing version ${d.viewVersion}. `, el("a", { href: `#/skill/${encodeURIComponent(id)}` }, `Go to current (v${s.version})`)) : null,
+    !d.viewVersion ? el("div", { class: "card muted" }, "No completed version yet. The write-up appears here when the deep dive finishes.") : null,
+    d.viewVersion ? [
+      el("p", { class: "muted small" }, "Sections marked “synthesis” are the model’s write-up from the verified facts below (citations like [F2] point at them); only “Key facts” are quote-verified."),
+      prose("overview"), prose("how_it_works"),
+      facts ? el("section", { class: "card" }, head(facts), (facts.items || []).length ? facts.items.map(f => el("div", { class: "finding", id: `fact-${f.n}` },
+        el("div", { class: "claim" }, `F${f.n}. `, f.claim), el("blockquote", {}, f.quote),
+        el("div", { class: "small" }, safeLink(f.url, f.title || f.url), el("span", { class: "muted" }, ` · ${f.sourceType} · ${f.site}${f.question ? ` · Q: ${f.question}` : ""}`))))
+        : el("p", { class: "muted" }, "No verified facts.")) : null,
+      list("practical_steps", true), list("open_questions", false),
+      el("section", { class: "card" }, el("h3", {}, "Related ", el("span", { class: "kind computed" }, "embedding similarity")),
+        el("div", {}, el("strong", {}, "Skills: "), rel.skills.length ? rel.skills.map((x, i) => [i ? ", " : "", el("a", { href: `#/skill/${encodeURIComponent(x.id)}` }, x.title), el("span", { class: "muted small" }, ` (${x.similarity})`)]) : el("span", { class: "muted" }, "none yet")),
+        el("div", {}, el("strong", {}, "Ideas: "), rel.ideas.length ? rel.ideas.map((x, i) => [i ? ", " : "", el("a", { href: `#/idea/${encodeURIComponent(x.id)}` }, x.title), el("span", { class: "muted small" }, ` (${x.similarity})`)]) : el("span", { class: "muted" }, "none above threshold"))),
+      d.sources.length ? el("section", { class: "card" }, el("h3", {}, `Sources (${d.sources.length})`),
+        el("ul", {}, d.sources.map(x => el("li", {}, safeLink(x.url, x.title || x.url), el("span", { class: "muted small" }, ` · ${x.sourceType} · ${x.cited ? "cited in key facts" : "read, not cited"}`))))) : null
+    ] : null,
+    el("section", { class: "card" }, el("h3", {}, "Version history"),
+      d.versions.length ? el("table", {}, el("tr", {}, el("th", {}, "version"), el("th", {}, "created"), el("th", {}, "verified facts"), el("th", {}, "duration")),
+        d.versions.map(v => el("tr", {}, el("td", {}, v.version === d.viewVersion ? el("strong", {}, `v${v.version} (viewing)`) : el("a", { href: `#/skill/${encodeURIComponent(id)}@${v.version}` }, `v${v.version}`), v.version === s.version ? " current" : ""),
+          el("td", {}, fmtTime(v.created_at)), el("td", {}, v.verifiedFacts ?? "—"), el("td", {}, v.total_ms != null ? `${Math.round(v.total_ms / 1000)} s` : "—"))))
+        : el("p", { class: "muted" }, "No versions yet."))
+  );
+  if (active) refreshTimer = setTimeout(() => { if (location.hash.startsWith(`#/skill/${encodeURIComponent(id)}`)) route(); }, SKILL_POLL_MS);
+}
+
 // ---------- router ----------
 async function route() {
   clearTimeout(refreshTimer);
   if (location.hash !== "#/ideas") lastAddNotice = null;
   const h = location.hash || "#/";
   document.querySelectorAll("nav a").forEach(a => a.classList.toggle("active",
-    a.getAttribute("href") === h || (h.startsWith("#/idea/") && a.getAttribute("href") === "#/ideas")));
+    a.getAttribute("href") === h || (h.startsWith("#/idea/") && a.getAttribute("href") === "#/ideas") || (h.startsWith("#/skill/") && a.getAttribute("href") === "#/skills")));
   try {
     if (h.startsWith("#/idea/")) await ideaDetail(decodeURIComponent(h.slice(7)));
+    else if (h.startsWith("#/skill/")) { const [sid, ver] = decodeURIComponent(h.slice(8)).split("@"); await skillDetail(sid, ver); }
+    else if (h === "#/skills") await skills();
     else if (h === "#/ideas") await ideas();
     else if (h === "#/jobs") await jobs();
     else await overview();
